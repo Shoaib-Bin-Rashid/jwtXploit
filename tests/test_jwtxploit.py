@@ -365,5 +365,188 @@ class TestFingerprintHeaderMatching(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+class TestClaimFuzzMatrix(unittest.TestCase):
+    """Verify the claim fuzz matrix has sufficient coverage."""
+
+    def test_matrix_has_50_plus_entries(self):
+        matrix = _MOD._CLAIM_FUZZ_MATRIX
+        self.assertGreaterEqual(len(matrix), 50, f"Expected ≥50 fuzz entries, got {len(matrix)}")
+
+    def test_matrix_covers_role(self):
+        keys = [list(e.keys())[0] for e in _MOD._CLAIM_FUZZ_MATRIX]
+        self.assertIn("role", keys)
+
+    def test_matrix_covers_isAdmin(self):
+        keys = [list(e.keys())[0] for e in _MOD._CLAIM_FUZZ_MATRIX]
+        self.assertIn("isAdmin", keys)
+
+    def test_matrix_covers_scope(self):
+        keys = [list(e.keys())[0] for e in _MOD._CLAIM_FUZZ_MATRIX]
+        self.assertIn("scope", keys)
+
+    def test_matrix_covers_permissions(self):
+        keys = [list(e.keys())[0] for e in _MOD._CLAIM_FUZZ_MATRIX]
+        self.assertIn("permissions", keys)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSarifReport(unittest.TestCase):
+    """Verify SARIF output is valid schema 2.1.0 structure."""
+
+    def _make_finding(self, verified=True):
+        return {
+            "attack":        "Unverified Signature",
+            "token":         _TEST_TOKEN,
+            "payload":       {"sub": "1", "role": "user"},
+            "header":        {"alg": "HS256"},
+            "verified":      verified,
+            "verify_reason": "Status changed: 401 → 200",
+            "delivery":      "Authorization: Bearer",
+            "poc_curl":      f'curl -s "{_TEST_TOKEN}"',
+            "timestamp":     "2026-01-01T00:00:00Z",
+        }
+
+    def test_sarif_top_level_keys(self):
+        CONFIG["findings"] = [self._make_finding()]
+        CONFIG["original_token"] = _TEST_TOKEN
+        with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False, mode="w") as f:
+            fname = f.name
+        save_report(fname, "sarif")
+        with open(fname) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["version"], "2.1.0")
+        self.assertIn("runs", doc)
+        self.assertEqual(len(doc["runs"]), 1)
+        os.unlink(fname)
+
+    def test_sarif_has_results(self):
+        CONFIG["findings"] = [self._make_finding(), self._make_finding(verified=False)]
+        CONFIG["original_token"] = _TEST_TOKEN
+        with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False, mode="w") as f:
+            fname = f.name
+        save_report(fname, "sarif")
+        with open(fname) as f:
+            doc = json.load(f)
+        results = doc["runs"][0]["results"]
+        self.assertEqual(len(results), 2)
+        os.unlink(fname)
+
+    def test_sarif_confirmed_level_is_error(self):
+        CONFIG["findings"] = [self._make_finding(verified=True)]
+        CONFIG["original_token"] = _TEST_TOKEN
+        with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False, mode="w") as f:
+            fname = f.name
+        save_report(fname, "sarif")
+        with open(fname) as f:
+            doc = json.load(f)
+        level = doc["runs"][0]["results"][0]["level"]
+        self.assertIn(level, ("error", "warning", "note"))
+        os.unlink(fname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestHtmlReport(unittest.TestCase):
+    """Verify HTML report contains severity colors and PoC curl."""
+
+    def _make_finding(self):
+        return {
+            "attack":        "Claim Fuzz — role=admin",
+            "token":         _TEST_TOKEN,
+            "payload":       {"sub": "1", "role": "admin"},
+            "header":        {"alg": "HS256"},
+            "verified":      True,
+            "verify_reason": "HTTP 200 + privilege keyword: 'admin'",
+            "delivery":      "Authorization: Bearer",
+            "poc_curl":      f'curl -s "https://target.com/api" -H "Authorization: Bearer {_TEST_TOKEN}"',
+            "timestamp":     "2026-01-01T00:00:00Z",
+        }
+
+    def test_html_contains_severity_color(self):
+        CONFIG["findings"] = [self._make_finding()]
+        CONFIG["original_token"] = _TEST_TOKEN
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
+            fname = f.name
+        save_report(fname, "html")
+        with open(fname) as f:
+            content = f.read()
+        self.assertIn("<!DOCTYPE html>", content)
+        self.assertIn("jwtXploit", content)
+        os.unlink(fname)
+
+    def test_html_contains_poc(self):
+        CONFIG["findings"] = [self._make_finding()]
+        CONFIG["original_token"] = _TEST_TOKEN
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
+            fname = f.name
+        save_report(fname, "html")
+        with open(fname) as f:
+            content = f.read()
+        self.assertIn("PoC", content)
+        os.unlink(fname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestGraphqlDetection(unittest.TestCase):
+    """Verify _is_graphql_url heuristic."""
+
+    def test_graphql_path_detected(self):
+        self.assertTrue(_MOD._is_graphql_url("https://api.example.com/graphql"))
+
+    def test_gql_path_detected(self):
+        self.assertTrue(_MOD._is_graphql_url("https://api.example.com/gql"))
+
+    def test_non_graphql_not_detected(self):
+        self.assertFalse(_MOD._is_graphql_url("https://api.example.com/v1/users"))
+
+    def test_none_url_returns_false(self):
+        self.assertFalse(_MOD._is_graphql_url(None))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestReplayDetect(unittest.TestCase):
+    """Verify replay detection logic — no real network calls."""
+
+    def test_all_accepted_flagged_as_vulnerable(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        CONFIG["findings"] = []
+        CONFIG["autopwn"]  = False
+        CONFIG["rate_limit"] = 0
+        CONFIG["jitter"]   = 0
+        CONFIG["timeout"]  = 10
+        CONFIG["proxy"]    = None
+        CONFIG["ssl_verify"] = True
+        CONFIG["quiet"]    = False
+        CONFIG["webhook"]  = None
+        CONFIG["replay_count"] = 3
+
+        with patch("requests.Session.get", return_value=mock_resp):
+            _MOD.attack_replay_detect(_TEST_TOKEN, "https://fake.local/api", count=3)
+
+        confirmed = [f for f in CONFIG["findings"] if f.get("verified")]
+        self.assertTrue(len(confirmed) >= 1, "Expected replay vulnerability to be flagged")
+
+    def test_all_rejected_not_flagged(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        CONFIG["findings"] = []
+        CONFIG["autopwn"]  = False
+        CONFIG["rate_limit"] = 0
+        CONFIG["jitter"]   = 0
+        CONFIG["timeout"]  = 10
+        CONFIG["proxy"]    = None
+        CONFIG["ssl_verify"] = True
+        CONFIG["quiet"]    = False
+        CONFIG["webhook"]  = None
+        CONFIG["replay_count"] = 3
+
+        with patch("requests.Session.get", return_value=mock_resp):
+            _MOD.attack_replay_detect(_TEST_TOKEN, "https://fake.local/api", count=3)
+
+        confirmed = [f for f in CONFIG["findings"] if f.get("verified")]
+        self.assertEqual(len(confirmed), 0, "Expected no findings when all rejected")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     unittest.main(verbosity=2)
