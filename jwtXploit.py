@@ -1035,7 +1035,8 @@ def _is_graphql_url(url):
 
 
 def check_url(token, url=None):
-    if not url:
+    if url is None:
+        # url not yet determined — ask user once (interactive mode only)
         if CONFIG.get("autopwn"):
             print(Fore.YELLOW + "[AUTOPWN] No --url specified — skipping HTTP check for this token.")
             return
@@ -1044,6 +1045,9 @@ def check_url(token, url=None):
         if not url:
             print(Fore.RED + "No URL provided. Skipping check.")
             return
+    elif url == "":
+        # Empty string = user explicitly answered blank to once-prompt — skip silently
+        return
 
     # HTTP method selection — autopwn defaults to GET silently
     methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -2596,6 +2600,10 @@ def attack_claim_fuzz(token, url=None):
     original_header = get_header(token)
     alg             = original_header.get("alg", "HS256")
 
+    # Ask for URL once up-front — avoids prompting 50 times per token
+    if not url and not CONFIG.get("autopwn"):
+        url = input(Fore.YELLOW + "[?] Enter URL to test claim-fuzz tokens against (blank to skip): ").strip()
+
     print(Fore.CYAN + f"\n[*] Claim Fuzzing — {len(_CLAIM_FUZZ_MATRIX)} privilege permutations...")
 
     for fuzz_claims in _CLAIM_FUZZ_MATRIX:
@@ -3645,6 +3653,9 @@ def attack_timestamp_overflow(token, url=None):
     original_header = get_header(token)
     alg             = original_header.get("alg", "HS256")
 
+    if not url and not CONFIG.get("autopwn"):
+        url = input(Fore.YELLOW + "[?] Enter URL to test timestamp tokens against (blank to skip): ").strip()
+
     print(Fore.CYAN + f"\n[*] Timestamp Overflow — testing {len(_TS_EDGE_CASES)} edge cases (nbf, iat, exp each)...")
 
     for claim in ("nbf", "exp", "iat"):
@@ -3736,6 +3747,9 @@ def attack_fuzz_header(token, url=None):
     decoded         = decode_token(token)
     original_header = get_header(token)
     alg             = original_header.get("alg", "HS256")
+
+    if not url and not CONFIG.get("autopwn"):
+        url = input(Fore.YELLOW + "[?] Enter URL to test header-fuzz tokens against (blank to skip): ").strip()
 
     print(Fore.CYAN + f"\n[*] Header Fuzz — testing {len(_HEADER_FUZZ_PARAMS)} parameter variants...")
 
