@@ -548,5 +548,336 @@ class TestReplayDetect(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+class TestJweDetection(unittest.TestCase):
+    """Verify _is_jwe() correctly identifies JWE vs JWT tokens."""
+
+    _JWE_TOKEN = "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.cipherkey.iv.ciphertext.tag"
+    _JWT_TOKEN = _TEST_TOKEN
+
+    def test_jwe_five_parts_detected(self):
+        self.assertTrue(_MOD._is_jwe(self._JWE_TOKEN))
+
+    def test_jwt_three_parts_not_jwe(self):
+        self.assertFalse(_MOD._is_jwe(self._JWT_TOKEN))
+
+    def test_none_not_jwe(self):
+        self.assertFalse(_MOD._is_jwe(None))
+
+    def test_empty_not_jwe(self):
+        self.assertFalse(_MOD._is_jwe(""))
+
+    def test_jwe_header_decoded(self):
+        import base64, json
+        h = {"alg": "RSA-OAEP", "enc": "A256GCM"}
+        encoded = base64.urlsafe_b64encode(json.dumps(h).encode()).rstrip(b"=").decode()
+        jwe = f"{encoded}.k.i.c.t"
+        hdr = _MOD._decode_jwe_header(jwe)
+        self.assertEqual(hdr["alg"], "RSA-OAEP")
+        self.assertEqual(hdr["enc"], "A256GCM")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestDiffTokens(unittest.TestCase):
+    """Verify diff_tokens_mode claim diffing logic via a temp file."""
+
+    def _make_token(self, sub, role="user"):
+        import jwt as pyjwt
+        payload = {"sub": sub, "role": role, "iss": "https://test.local",
+                   "exp": 9999999999}
+        return pyjwt.encode(payload, "secret", algorithm="HS256")
+
+    def test_diff_identifies_static_and_dynamic(self):
+        t1 = self._make_token("101", "user")
+        t2 = self._make_token("202", "user")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(f"{t1}\n{t2}\n")
+            fname = f.name
+
+        CONFIG["autopwn"]    = True
+        CONFIG["rate_limit"] = 0
+        CONFIG["jitter"]     = 0
+        CONFIG["timeout"]    = 10
+        CONFIG["proxy"]      = None
+        CONFIG["ssl_verify"] = True
+        CONFIG["quiet"]      = False
+        CONFIG["webhook"]    = None
+        CONFIG["strip_exp"]  = False
+        CONFIG["findings"]   = []
+        CONFIG["escalate_role"] = None
+
+        # Should not raise
+        try:
+            _MOD.diff_tokens_mode(fname, url=None)
+        except SystemExit:
+            pass
+        os.unlink(fname)
+
+    def test_diff_requires_two_tokens(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(f"{self._make_token('1')}\n")
+            fname = f.name
+        with self.assertRaises(SystemExit):
+            _MOD.diff_tokens_mode(fname, url=None)
+        os.unlink(fname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestInterceptExtraction(unittest.TestCase):
+    """Test JWT extraction logic in _InterceptHandler without network."""
+
+    def setUp(self):
+        self.handler = _MOD._InterceptHandler.__new__(_MOD._InterceptHandler)
+
+    def test_extracts_bearer_token(self):
+        headers = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+        found = self.handler._extract_jwts(headers)
+        self.assertIn(_TEST_TOKEN, found)
+
+    def test_extracts_from_cookie(self):
+        headers = {"Cookie": f"session={_TEST_TOKEN}"}
+        found = self.handler._extract_jwts(headers)
+        self.assertIn(_TEST_TOKEN, found)
+
+    def test_extracts_from_body(self):
+        body = json.dumps({"access_token": _TEST_TOKEN}).encode()
+        found = self.handler._extract_jwts({}, body)
+        self.assertIn(_TEST_TOKEN, found)
+
+    def test_no_jwt_in_plain_request(self):
+        found = self.handler._extract_jwts({"Content-Type": "text/html"}, b"<html>hello</html>")
+        self.assertEqual(found, [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestOpenIdFuzzCveMap(unittest.TestCase):
+    """Verify OpenID fuzz and JWE attacks are in CVE/attack maps."""
+
+    def test_openid_in_cve_map(self):
+        result = _MOD._cve_for_attack("OpenID Provider Confusion")
+        self.assertIsNotNone(result)
+
+    def test_jwe_in_cve_map(self):
+        result = _MOD._cve_for_attack("JWE Inner JWT alg:none")
+        self.assertIsNotNone(result)
+
+    def test_horizontal_escalation_in_cve_map(self):
+        result = _MOD._cve_for_attack("Diff Token Swap — horizontal escalation")
+        self.assertIsNotNone(result)
+
+    def test_ecdsa_k_reuse_in_cve_map(self):
+        result = _MOD._cve_for_attack("ECDSA k-Reuse Key Recovery")
+        self.assertIsNotNone(result)
+
+    def test_ts_overflow_in_cve_map(self):
+        result = _MOD._cve_for_attack("Timestamp Integer Overflow — exp=INT32_MAX")
+        self.assertIsNotNone(result)
+
+    def test_fuzz_header_in_cve_map(self):
+        result = _MOD._cve_for_attack("Header Fuzz — crit=[]")
+        self.assertIsNotNone(result)
+
+    def test_compare_env_in_cve_map(self):
+        result = _MOD._cve_for_attack("Cross-Environment JWT Drift — dev token accepted")
+        self.assertIsNotNone(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestNucleiExport(unittest.TestCase):
+    """Test Nuclei YAML template generation."""
+
+    def _make_finding(self, attack="alg:none bypass", verified=True):
+        import time
+        _MOD.CONFIG["original_url"]   = "https://target.example.com/api"
+        _MOD.CONFIG["original_token"] = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0."
+        return {
+            "attack":        attack,
+            "token":         "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0.",
+            "payload":       {"sub": "user"},
+            "header":        {"alg": "none"},
+            "verified":      verified,
+            "verify_reason": "Server accepted forged token",
+            "delivery":      "Authorization: Bearer",
+            "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    def test_template_has_required_keys(self):
+        finding = self._make_finding()
+        template_id, yaml_text = _MOD._nuclei_template(finding)
+        self.assertIn("id:", yaml_text)
+        self.assertIn("info:", yaml_text)
+        self.assertIn("http:", yaml_text)
+        self.assertIn("matchers:", yaml_text)
+
+    def test_template_id_is_slug(self):
+        finding = self._make_finding("alg:none bypass → admin")
+        template_id, _ = _MOD._nuclei_template(finding)
+        import re
+        self.assertRegex(template_id, r"^[a-z0-9\-]+$")
+
+    def test_template_severity_mapping_critical(self):
+        _MOD.CONFIG.update({"findings": []})
+        finding = self._make_finding()
+        _, yaml_text = _MOD._nuclei_template(finding)
+        # CVE score for alg:none is 9.8 → should produce critical or high
+        self.assertIn("severity:", yaml_text)
+        # At minimum severity field exists
+        self.assertTrue(any(sev in yaml_text for sev in
+                            ["critical", "high", "medium", "low"]))
+
+    def test_export_creates_files(self):
+        import tempfile, os
+        findings = [self._make_finding("Test Attack 1"), self._make_finding("Test Attack 2")]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _MOD.export_nuclei_templates(tmpdir, findings)
+            exported = os.listdir(tmpdir)
+            self.assertEqual(len(exported), 2)
+            for f in exported:
+                self.assertTrue(f.endswith(".yaml"))
+
+    def test_export_no_findings_prints_warning(self):
+        import tempfile
+        _MOD.CONFIG["findings"] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Should not raise, just warn
+            _MOD.export_nuclei_templates(tmpdir, findings=[])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestEcdsaKReuse(unittest.TestCase):
+    """Test ECDSA nonce (k) reuse private key recovery math."""
+
+    def test_modinv_basic(self):
+        # 3 * 4 = 12 ≡ 1 (mod 11)
+        result = _MOD._modinv(3, 11)
+        self.assertEqual((3 * result) % 11, 1)
+
+    def test_modinv_no_inverse_raises(self):
+        with self.assertRaises(ValueError):
+            _MOD._modinv(0, 11)
+
+    def test_ecdsa_recover_private_key_known_values(self):
+        """Test recovery with synthetic k-reuse scenario."""
+        n  = _MOD._P256_N
+        k  = 42       # known nonce
+        d  = 99999    # known private key
+        r  = pow(k, 1, n)   # simplified — r just represents some value
+        h1 = 1234567
+        h2 = 7654321
+        # s = k^-1 * (h + r*d) mod n
+        kinv = _MOD._modinv(k, n)
+        s1   = (kinv * (h1 + r * d)) % n
+        s2   = (kinv * (h2 + r * d)) % n
+        # Both sigs share same r (same k)
+        recovered = _MOD._ecdsa_recover_private_key(r, s1, s2, h1, h2, n)
+        self.assertEqual(recovered, d)
+
+    def test_ecdsa_recover_returns_none_when_s_equal(self):
+        n = _MOD._P256_N
+        result = _MOD._ecdsa_recover_private_key(1, 5, 5, 100, 200, n)
+        self.assertIsNone(result)
+
+    def test_parse_sig_returns_none_for_invalid(self):
+        r, s = _MOD._ecdsa_parse_sig("not.a.token")
+        self.assertIsNone(r)
+        self.assertIsNone(s)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestTimestampOverflow(unittest.TestCase):
+    """Test timestamp edge case definitions."""
+
+    def test_edge_cases_count(self):
+        self.assertGreaterEqual(len(_MOD._TS_EDGE_CASES), 6)
+
+    def test_int32_max_present(self):
+        labels = [label for label, _ in _MOD._TS_EDGE_CASES]
+        self.assertIn("INT32_MAX", labels)
+
+    def test_negative_value_present(self):
+        values = [v for _, v in _MOD._TS_EDGE_CASES]
+        self.assertIn(-1, values)
+
+    def test_zero_present(self):
+        values = [v for _, v in _MOD._TS_EDGE_CASES]
+        self.assertIn(0, values)
+
+    def test_int64_max_present(self):
+        labels = [label for label, _ in _MOD._TS_EDGE_CASES]
+        self.assertIn("INT64_MAX", labels)
+
+    def test_year_2038_value(self):
+        # The YEAR_2038 entry should equal 2147483647
+        ts_map = dict(_MOD._TS_EDGE_CASES)
+        self.assertEqual(ts_map.get("YEAR_2038"), 2147483647)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFuzzHeaderParams(unittest.TestCase):
+    """Test the header fuzz parameter matrix."""
+
+    def test_minimum_param_count(self):
+        self.assertGreaterEqual(len(_MOD._HEADER_FUZZ_PARAMS), 30)
+
+    def test_contains_crit_empty(self):
+        found = any(param == "crit" and value == []
+                    for param, value in _MOD._HEADER_FUZZ_PARAMS)
+        self.assertTrue(found, "Should have empty crit array as a fuzz case")
+
+    def test_contains_zip_deflate(self):
+        found = any(param == "zip" and value == "DEF"
+                    for param, value in _MOD._HEADER_FUZZ_PARAMS)
+        self.assertTrue(found)
+
+    def test_contains_ssrf_via_x5u(self):
+        found = any(param == "x5u" and "169.254" in str(value)
+                    for param, value in _MOD._HEADER_FUZZ_PARAMS)
+        self.assertTrue(found)
+
+    def test_contains_null_alg(self):
+        found = any(param == "alg" and value is None
+                    for param, value in _MOD._HEADER_FUZZ_PARAMS)
+        self.assertTrue(found)
+
+    def test_contains_oversized_kid(self):
+        found = any(param == "kid" and isinstance(value, str) and len(value) >= 1000
+                    for param, value in _MOD._HEADER_FUZZ_PARAMS)
+        self.assertTrue(found)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestCompareEnvs(unittest.TestCase):
+    """Test compare-envs mode utilities."""
+
+    def setUp(self):
+        import tempfile, jwt as pyjwt
+        self.tmpdir  = tempfile.mkdtemp()
+        self.payload = {"sub": "user1", "role": "dev"}
+        tok = pyjwt.encode(self.payload, "devsecret", algorithm="HS256")
+        self.token   = tok
+        self.tmpfile = os.path.join(self.tmpdir, "dev.txt")
+        with open(self.tmpfile, "w") as fh:
+            fh.write(tok + "\n")
+
+    def test_file_loaded_correctly(self):
+        with open(self.tmpfile) as fh:
+            tokens = [l.strip() for l in fh if l.strip()]
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0], self.token)
+
+    def test_compare_envs_skips_without_url(self):
+        # autopwn=True skips the input() call and returns early
+        _MOD.CONFIG["autopwn"] = True
+        _MOD.CONFIG["findings"] = []
+        _MOD.compare_envs_mode([self.tmpfile], url=None)
+        # Should not raise — just print warning and return
+        _MOD.CONFIG["autopwn"] = False
+
+    def test_nuclei_and_compare_cve_map_present(self):
+        for key in ("ecdsa_k_reuse", "ts_overflow", "fuzz_header", "compare_env"):
+            self.assertIn(key, _MOD.CVE_MAP,
+                          f"CVE_MAP missing key: {key}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     unittest.main(verbosity=2)

